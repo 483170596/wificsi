@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import socket
 import subprocess
 import sys
@@ -22,7 +23,7 @@ OTHER_NODE_ID = "02:aa:bb:cc:dd:ee"
 
 def _metric(observed_at, *, state="INACTIVE", sample_interval=1.0, csi_rate=43.88,
             message_deltas=None, command_results=None, **changes):
-    csi_delta = 0 if csi_rate is None or sample_interval is None else sample_interval * csi_rate
+    csi_delta = 0 if csi_rate is None or sample_interval is None else int(sample_interval * csi_rate)
     value = {
         "observed_at": observed_at,
         "server_run_started_at": observed_at - 1,
@@ -155,6 +156,68 @@ def test_csi_delta_must_match_the_reported_csi_message_delta():
     assert "csi_delta_message_delta_mismatch" in validate(metrics, observations).failures
 
 
+def test_validator_rejects_nonfinite_and_boolean_numeric_evidence():
+    metrics, observations = _passing_inputs()
+    next(row for row in metrics if row.get("sample_interval"))["sample_interval"] = math.nan
+    assert "invalid_sample_interval" in validate(metrics, observations).failures
+
+    metrics, observations = _passing_inputs()
+    next(row for row in metrics if row.get("sample_interval"))["csi_rate"] = math.inf
+    assert "invalid_csi_measurement" in validate(metrics, observations).failures
+
+    metrics, observations = _passing_inputs()
+    observations["server_stopped_at"] = -math.inf
+    assert "missing_server_restart_observation" in validate(metrics, observations).failures
+
+    metrics, observations = _passing_inputs()
+    next(row for row in metrics if row.get("sample_interval"))["sample_interval"] = True
+    assert "invalid_sample_interval" in validate(metrics, observations).failures
+
+
+def test_validator_requires_exact_integer_csi_and_counter_quantities():
+    metrics, observations = _passing_inputs()
+    measured = next(row for row in metrics if row.get("sample_interval"))
+    measured["csi_delta"] = 1097.5
+    measured["message_deltas"]["CSI_FRAME"] = 1097.5
+    measured["csi_rate"] = 1097.5 / measured["sample_interval"]
+    assert "csi_delta_message_delta_mismatch" in validate(metrics, observations).failures
+
+    metrics, observations = _passing_inputs()
+    measured = next(row for row in metrics if row.get("sample_interval"))
+    measured["csi_delta"] = True
+    measured["message_deltas"]["CSI_FRAME"] = True
+    measured["csi_rate"] = 1 / measured["sample_interval"]
+    assert "csi_delta_message_delta_mismatch" in validate(metrics, observations).failures
+
+    metrics, observations = _passing_inputs()
+    metrics[-1]["server_duplicates"] = 0.0
+    assert "missing_link_counters" in validate(metrics, observations).failures
+
+
+def test_validator_rejects_submillisecond_structural_and_count_mismatches():
+    metrics, observations = _passing_inputs()
+    for row in (row for row in metrics if row.get("sample_interval")):
+        row["sample_started_at"] += 0.0005
+    result = validate(metrics, observations)
+    assert "invalid_sample_interval" in result.failures
+    assert result.metrics["duration_seconds"] < 600
+
+    metrics, observations = _passing_inputs()
+    measured = next(row for row in metrics if row.get("sample_interval"))
+    measured["message_deltas"]["CSI_FRAME"] += 0.0005
+    assert "csi_delta_message_delta_mismatch" in validate(metrics, observations).failures
+
+
+def test_validator_rejects_rate_difference_beyond_machine_precision():
+    metrics, observations = _passing_inputs()
+    measured = [row for row in metrics if row.get("sample_interval")][-1]
+    measured.update(observed_at=4000, sample_started_at=2000, sample_interval=2000,
+                    csi_delta=43879, csi_rate=21.94)
+    measured["message_deltas"]["CSI_FRAME"] = 43879
+
+    assert "invalid_csi_measurement" in validate(metrics, observations).failures
+
+
 def test_reconnect_requires_deltas_strictly_after_the_observed_resume_time():
     metrics, observations = _passing_inputs()
     for row in metrics:
@@ -283,6 +346,27 @@ def test_stage2_validate_cli_reads_jsonl_and_prints_one_summary(tmp_path):
 
     assert process.returncode == 0
     assert json.loads(process.stdout)["passed"] is True
+
+
+def test_stage2_validate_cli_rejects_nonstandard_nan_and_infinity_tokens(tmp_path):
+    for name, mutate in (
+        ("nan", lambda metrics, observations: next(row for row in metrics if row.get("sample_interval")).update(sample_interval=math.nan)),
+        ("infinity", lambda metrics, observations: observations.update(server_stopped_at=math.inf)),
+    ):
+        metrics, observations = _passing_inputs()
+        mutate(metrics, observations)
+        metrics_path = tmp_path / f"{name}.jsonl"
+        observations_path = tmp_path / f"{name}.json"
+        metrics_path.write_text("".join(json.dumps(row) + "\n" for row in metrics), encoding="utf-8")
+        observations_path.write_text(json.dumps(observations), encoding="utf-8")
+
+        process = subprocess.run(
+            [sys.executable, "tools/stage2_validate.py", "--metrics", str(metrics_path), "--observations", str(observations_path)],
+            cwd=ROOT, check=False, capture_output=True, text=True,
+        )
+
+        assert process.returncode == 1
+        assert json.loads(process.stdout)["failures"] == ["invalid_json"]
 
 
 def test_accelerated_simulator_fault_matrix_recovers_then_validates_real_timestamps(tmp_path):

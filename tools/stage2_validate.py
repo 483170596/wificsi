@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,26 @@ class Stage2Result:
 
 
 def _number(value: object) -> float | None:
-    return float(value) if isinstance(value, int | float) else None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _count(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _ulp_close(left: float, right: float, *operands: float) -> bool:
+    scale = max(math.ulp(value) for value in (left, right, *operands))
+    return abs(left - right) <= 8 * scale
+
+
+def _at_least(value: float, threshold: float) -> bool:
+    return value > threshold or _ulp_close(value, threshold)
 
 
 def _command_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -37,9 +57,9 @@ def _command_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _message_total(rows: list[dict[str, Any]], name: str) -> int:
     return sum(
-        int(value) for row in rows
+        value for row in rows
         if isinstance(row.get("message_deltas"), dict)
-        if (value := _number(row["message_deltas"].get(name))) is not None and value > 0
+        if (value := _count(row["message_deltas"].get(name))) is not None and value > 0
     )
 
 
@@ -56,7 +76,7 @@ def _sample_interval(row: dict[str, Any]) -> float | None:
         or interval <= 0
         or started < run_started
         or observed <= started
-        or abs((observed - started) - interval) > 0.001
+        or not _ulp_close(observed - started, interval, observed, started)
     ):
         return None
     return interval
@@ -67,7 +87,7 @@ def _has_target_telemetry(row: dict[str, Any]) -> bool:
     return (
         row.get("state") != "OFFLINE"
         and isinstance(deltas, dict)
-        and any((_number(deltas.get(name)) or 0) > 0 for name in REQUIRED_RESUMED_MESSAGES)
+        and any((_count(deltas.get(name)) or 0) > 0 for name in REQUIRED_RESUMED_MESSAGES)
     )
 
 
@@ -99,23 +119,27 @@ def validate(
         failures.append("non_monotonic_observed_at")
     start_time = min(timestamps) if timestamps else 0.0
     end_time = max(timestamps) if timestamps else 0.0
-    duration = 0.0
+    duration_intervals: list[float] = []
 
     if any(row.get("server_host") != expected_host or row.get("server_port") != expected_port for row in target_rows):
         failures.append("wrong_server_endpoint")
-    qualified_seconds = 0.0
+    qualified_intervals: list[float] = []
     seen_runs: set[float] = set()
     last_interval_end: float | None = None
     for row in target_rows:
         interval = _sample_interval(row)
-        delta = _number(row.get("csi_delta"))
+        delta = _count(row.get("csi_delta"))
         rate = _number(row.get("csi_rate"))
         run_started = _number(row.get("server_run_started_at"))
         first_in_run = run_started is not None and run_started not in seen_runs
         if first_in_run:
             seen_runs.add(run_started)
-        if _number(row.get("sample_interval")) is not None and interval is None:
+        if row.get("sample_interval") is not None and interval is None:
             failures.append("invalid_sample_interval")
+        if row.get("csi_delta") is not None and delta is None:
+            failures.append("csi_delta_message_delta_mismatch")
+        if row.get("csi_rate") is not None and rate is None:
+            failures.append("invalid_csi_measurement")
         if interval is None:
             continue
         if run_started is None:
@@ -135,22 +159,25 @@ def validate(
             continue
         last_interval_end = observed
         message_deltas = row.get("message_deltas")
-        csi_messages = _number(message_deltas.get("CSI_FRAME")) if isinstance(message_deltas, dict) else None
-        if csi_messages is None or csi_messages < 0 or delta is None or delta < 0 or abs(delta - csi_messages) > 0.001:
+        csi_messages = _count(message_deltas.get("CSI_FRAME")) if isinstance(message_deltas, dict) else None
+        if csi_messages is None or delta is None or delta != csi_messages:
             failures.append("csi_delta_message_delta_mismatch")
             continue
-        if rate is None or abs(rate - delta / interval) > 0.001:
+        expected_rate = delta / interval
+        if rate is None or not _ulp_close(rate, expected_rate, delta, interval):
             failures.append("invalid_csi_measurement")
             continue
         if _has_target_telemetry(row):
-            duration += interval
-        if rate >= MIN_CSI_RATE and (_number(row.get("parse_errors")) or 0) == 0:
-            qualified_seconds += interval
-    if duration < minimum_duration:
+            duration_intervals.append(interval)
+        if rate >= MIN_CSI_RATE and _count(row.get("parse_errors")) == 0:
+            qualified_intervals.append(interval)
+    duration = math.fsum(duration_intervals)
+    qualified_seconds = math.fsum(qualified_intervals)
+    if not _at_least(duration, minimum_duration):
         failures.append("duration_below_600_seconds")
-    if any((_number(row.get("parse_errors")) or 0) > 0 for row in target_rows):
+    if any((count := _count(row.get("parse_errors"))) is None or count > 0 for row in target_rows):
         failures.append("protocol_parse_errors")
-    if qualified_seconds < minimum_csi_seconds:
+    if not _at_least(qualified_seconds, minimum_csi_seconds):
         failures.append("insufficient_valid_csi_rate")
 
     states = {row.get("state") for row in target_rows}
@@ -158,7 +185,7 @@ def validate(
         failures.append("missing_active_state")
     if "INACTIVE" not in states:
         failures.append("missing_inactive_state")
-    if any(any(counter not in row or _number(row[counter]) is None for counter in REQUIRED_COUNTERS) for row in target_rows):
+    if any(any(counter not in row or _count(row[counter]) is None for counter in REQUIRED_COUNTERS) for row in target_rows):
         failures.append("missing_link_counters")
 
     stopped = _number(observations.get("server_stopped_at"))
@@ -246,11 +273,15 @@ def _read_metrics(path: Path) -> list[dict[str, Any]]:
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.strip():
-            value = json.loads(line)
+            value = json.loads(line, parse_constant=_reject_nonstandard_number)
             if not isinstance(value, dict):
                 raise ValueError("metrics JSONL entries must be objects")
             rows.append(value)
     return rows
+
+
+def _reject_nonstandard_number(value: str) -> None:
+    raise ValueError(f"non-standard JSON numeric token: {value}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -258,11 +289,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--metrics", type=Path, required=True)
     parser.add_argument("--observations", type=Path, required=True)
     args = parser.parse_args(argv)
-    observations = json.loads(args.observations.read_text(encoding="utf-8"))
-    if not isinstance(observations, dict):
-        raise ValueError("observations JSON must be an object")
-    result = validate(_read_metrics(args.metrics), observations)
-    print(json.dumps(asdict(result), sort_keys=True, separators=(",", ":")))
+    try:
+        observations = json.loads(
+            args.observations.read_text(encoding="utf-8"), parse_constant=_reject_nonstandard_number,
+        )
+        if not isinstance(observations, dict):
+            raise ValueError("observations JSON must be an object")
+        result = validate(_read_metrics(args.metrics), observations)
+    except (OSError, ValueError, json.JSONDecodeError):
+        result = Stage2Result(False, ("invalid_json",), {"duration_seconds": 0, "qualified_csi_seconds": 0})
+    print(json.dumps(asdict(result), sort_keys=True, separators=(",", ":"), allow_nan=False))
     return 0 if result.passed else 1
 
 
