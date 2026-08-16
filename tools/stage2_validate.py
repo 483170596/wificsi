@@ -43,6 +43,25 @@ def _message_total(rows: list[dict[str, Any]], name: str) -> int:
     )
 
 
+def _sample_interval(row: dict[str, Any]) -> float | None:
+    started = _number(row.get("sample_started_at"))
+    observed = _number(row.get("observed_at"))
+    interval = _number(row.get("sample_interval"))
+    run_started = _number(row.get("server_run_started_at"))
+    if (
+        started is None
+        or observed is None
+        or interval is None
+        or run_started is None
+        or interval <= 0
+        or started < run_started
+        or observed <= started
+        or abs((observed - started) - interval) > 0.001
+    ):
+        return None
+    return interval
+
+
 def validate(
     rows: list[dict[str, Any]],
     observations: dict[str, Any],
@@ -71,25 +90,27 @@ def validate(
         failures.append("non_monotonic_observed_at")
     start_time = min(timestamps) if timestamps else 0.0
     end_time = max(timestamps) if timestamps else 0.0
-    duration = end_time - start_time
+    duration = 0.0
 
     if any(row.get("server_host") != expected_host or row.get("server_port") != expected_port for row in target_rows):
         failures.append("wrong_server_endpoint")
-    if duration < minimum_duration:
-        failures.append("duration_below_600_seconds")
-
     qualified_seconds = 0.0
     for row in target_rows:
-        interval = _number(row.get("sample_interval"))
+        interval = _sample_interval(row)
         delta = _number(row.get("csi_delta"))
         rate = _number(row.get("csi_rate"))
-        if interval is None or interval <= 0:
+        if _number(row.get("sample_interval")) is not None and interval is None:
+            failures.append("invalid_sample_interval")
+        if interval is None:
             continue
+        duration += interval
         if delta is None or delta < 0 or rate is None or abs(rate - delta / interval) > 0.001:
             failures.append("invalid_csi_measurement")
             continue
         if rate >= MIN_CSI_RATE and (_number(row.get("parse_errors")) or 0) == 0:
             qualified_seconds += interval
+    if duration < minimum_duration:
+        failures.append("duration_below_600_seconds")
     if any((_number(row.get("parse_errors")) or 0) > 0 for row in target_rows):
         failures.append("protocol_parse_errors")
     if qualified_seconds < minimum_csi_seconds:
@@ -134,20 +155,27 @@ def validate(
     reconnected = _number(observations.get("reconnect_reconnected_at"))
     if disconnected is None or reconnected is None:
         failures.append("missing_reconnect_cycle")
-    elif not start_time <= disconnected <= reconnected <= end_time:
-        failures.append("reconnect_outside_evidence_window")
     elif reconnected < disconnected:
         failures.append("invalid_reconnect_observation_order")
+    elif not start_time <= disconnected <= reconnected <= end_time:
+        failures.append("reconnect_outside_evidence_window")
     else:
         boot_ids = {row.get("boot_id") for row in target_rows if row.get("boot_id") is not None}
         if len(boot_ids) != 1:
             failures.append("reconnect_reboot_detected")
         post_reconnect = [
             row for row, timestamp in zip(target_rows, times)
-            if timestamp is not None and timestamp >= reconnected
+            if (
+                timestamp is not None
+                and timestamp > reconnected
+                and (sample_started := _number(row.get("sample_started_at"))) is not None
+                and sample_started >= reconnected
+            )
         ]
         if not all(_message_total(post_reconnect, name) > 0 for name in REQUIRED_RESUMED_MESSAGES):
             failures.append("missing_post_reconnect_telemetry")
+        if any(event in {stopped, started, rediscovered} for event in (disconnected, reconnected)):
+            failures.append("reconnect_not_distinct_from_server_restart")
 
     events = _command_events(rows)
     command_nodes = {event.get("node_id") for event in events if event.get("opcode") in {"GET_CONFIG", "RESET_BASELINE"}}

@@ -96,6 +96,7 @@ def _metrics_row(
             "server_host": host, "server_port": port,
             "node_id": None, "boot_id": None, "state": "OFFLINE",
             "message_counts": {}, "message_deltas": {}, "sample_interval": None,
+            "sample_started_at": None,
             "csi_delta": 0, "csi_rate": None,
             "device_queue_dropped": 0, "device_send_errors": 0,
             "server_sequence_gaps": 0, "server_duplicates": 0,
@@ -105,9 +106,9 @@ def _metrics_row(
     counts = Counter(dict(node.message_counts))
     heartbeat = node.heartbeat
     csi_count = counts[MessageType.CSI_FRAME]
-    prior_matches_boot = previous is not None and previous[1] == node.boot_id
-    if prior_matches_boot:
-        interval = observed_at - previous[0]
+    if previous is not None and previous[1] == node.boot_id:
+        sample_started_at = previous[0]
+        interval = observed_at - sample_started_at
         csi_delta = csi_count - previous[2]
         if interval <= 0 or csi_delta < 0:
             interval = None
@@ -120,7 +121,16 @@ def _metrics_row(
                 kind.name: max(0, counts[kind] - previous[3][kind])
                 for kind in MessageType
             }
+    elif previous is None:
+        sample_started_at = server_run_started_at
+        interval = observed_at - sample_started_at
+        csi_delta = csi_count
+        csi_rate = csi_delta / interval if interval > 0 else None
+        if interval <= 0:
+            interval = None
+        message_deltas = {kind.name: counts[kind] for kind in MessageType}
     else:
+        sample_started_at = None
         interval = None
         csi_delta = 0
         csi_rate = None
@@ -135,6 +145,7 @@ def _metrics_row(
         "message_counts": {kind.name: counts[kind] for kind in MessageType},
         "message_deltas": message_deltas,
         "sample_interval": interval,
+        "sample_started_at": sample_started_at,
         "csi_delta": csi_delta,
         "csi_rate": csi_rate,
         "device_queue_dropped": heartbeat.queue_dropped if heartbeat else 0,

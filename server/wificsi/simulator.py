@@ -46,6 +46,8 @@ class SimulatorConfig:
     state_interval: float = 1.0
     heartbeat_interval: float = 1.0
     boot_id: int = 0x10203040
+    telemetry_pause_at: float | None = None
+    telemetry_pause_duration: float = 0.0
 
     def __post_init__(self):
         if len(self.node_id) != 6:
@@ -56,6 +58,11 @@ class SimulatorConfig:
             raise ValueError("CSI lengths must be positive")
         if self.boot_id == 0:
             raise ValueError("boot_id must be nonzero")
+        if self.telemetry_pause_at is None:
+            if self.telemetry_pause_duration != 0:
+                raise ValueError("pause duration requires a pause start")
+        elif not 0 <= self.telemetry_pause_at < self.duration or self.telemetry_pause_duration <= 0:
+            raise ValueError("pause must begin during the run and have a positive duration")
 
 
 class SimulatedNode:
@@ -205,7 +212,7 @@ class _SimulatorProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr) -> None:
         ack = self.node.handle_command(data)
         if ack is not None and self.transport is not None:
-            self.transport.sendto(ack)
+            self.transport.sendto(ack, addr)
 
 
 async def run_simulator(config: SimulatorConfig) -> None:
@@ -213,40 +220,60 @@ async def run_simulator(config: SimulatorConfig) -> None:
     node = SimulatedNode(config)
     transport, _ = await loop.create_datagram_endpoint(
         lambda: _SimulatorProtocol(node),
-        remote_addr=(config.host, config.port),
+        local_addr=("0.0.0.0", 0),
     )
     start = loop.time()
     next_hello = start
     next_state = start
     next_heartbeat = start
+    was_paused = False
     total_frames = math.ceil(config.duration * config.rate)
 
     def elapsed_us() -> int:
         return max(0, int((loop.time() - start) * 1_000_000))
+
+    def send(data: bytes) -> None:
+        transport.sendto(data, (config.host, config.port))
 
     try:
         for frame_index in range(total_frames):
             target = start + frame_index / config.rate
             await asyncio.sleep(max(0.0, target - loop.time()))
             now = loop.time()
+            elapsed = now - start
+            if (
+                config.telemetry_pause_at is not None
+                and config.telemetry_pause_at <= elapsed < config.telemetry_pause_at + config.telemetry_pause_duration
+            ):
+                was_paused = True
+                continue
+            if was_paused:
+                state = StableState.ACTIVE if elapsed < config.duration / 2 else StableState.INACTIVE
+                send(node.hello(elapsed_us()))
+                send(node.sensing(elapsed_us(), state))
+                send(node.heartbeat(elapsed_us()))
+                next_hello = now + config.hello_interval
+                next_state = now + config.state_interval
+                next_heartbeat = now + config.heartbeat_interval
+                was_paused = False
             while now >= next_hello:
-                transport.sendto(node.hello(elapsed_us()))
+                send(node.hello(elapsed_us()))
                 next_hello += config.hello_interval
             while now >= next_state:
                 state = (
                     StableState.ACTIVE
-                    if now - start < config.duration / 2
+                    if elapsed < config.duration / 2
                     else StableState.INACTIVE
                 )
-                transport.sendto(node.sensing(elapsed_us(), state))
+                send(node.sensing(elapsed_us(), state))
                 next_state += config.state_interval
             while now >= next_heartbeat:
-                transport.sendto(node.heartbeat(elapsed_us()))
+                send(node.heartbeat(elapsed_us()))
                 next_heartbeat += config.heartbeat_interval
-            transport.sendto(node.csi(elapsed_us(), frame_index))
+            send(node.csi(elapsed_us(), frame_index))
 
-        transport.sendto(node.sensing(elapsed_us(), StableState.INACTIVE))
-        transport.sendto(node.heartbeat(elapsed_us()))
+        send(node.sensing(elapsed_us(), StableState.INACTIVE))
+        send(node.heartbeat(elapsed_us()))
         await asyncio.sleep(0)
     finally:
         transport.close()
