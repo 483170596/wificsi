@@ -104,19 +104,46 @@ def validate(
     if any(row.get("server_host") != expected_host or row.get("server_port") != expected_port for row in target_rows):
         failures.append("wrong_server_endpoint")
     qualified_seconds = 0.0
+    seen_runs: set[float] = set()
+    last_interval_end: float | None = None
     for row in target_rows:
         interval = _sample_interval(row)
         delta = _number(row.get("csi_delta"))
         rate = _number(row.get("csi_rate"))
+        run_started = _number(row.get("server_run_started_at"))
+        first_in_run = run_started is not None and run_started not in seen_runs
+        if first_in_run:
+            seen_runs.add(run_started)
         if _number(row.get("sample_interval")) is not None and interval is None:
             failures.append("invalid_sample_interval")
         if interval is None:
             continue
-        if _has_target_telemetry(row):
-            duration += interval
-        if delta is None or delta < 0 or rate is None or abs(rate - delta / interval) > 0.001:
+        if run_started is None:
+            failures.append("invalid_sample_interval")
+            continue
+        if first_in_run:
+            failures.append("pre_discovery_sample_interval")
+            continue
+        sample_started = _number(row.get("sample_started_at"))
+        observed = _number(row.get("observed_at"))
+        if sample_started is None or observed is None:
+            failures.append("invalid_sample_interval")
+            continue
+        if last_interval_end is not None and sample_started < last_interval_end:
+            failures.append("overlapping_sample_intervals")
+            last_interval_end = max(last_interval_end, observed)
+            continue
+        last_interval_end = observed
+        message_deltas = row.get("message_deltas")
+        csi_messages = _number(message_deltas.get("CSI_FRAME")) if isinstance(message_deltas, dict) else None
+        if csi_messages is None or csi_messages < 0 or delta is None or delta < 0 or abs(delta - csi_messages) > 0.001:
+            failures.append("csi_delta_message_delta_mismatch")
+            continue
+        if rate is None or abs(rate - delta / interval) > 0.001:
             failures.append("invalid_csi_measurement")
             continue
+        if _has_target_telemetry(row):
+            duration += interval
         if rate >= MIN_CSI_RATE and (_number(row.get("parse_errors")) or 0) == 0:
             qualified_seconds += interval
     if duration < minimum_duration:
@@ -165,7 +192,7 @@ def validate(
     reconnected = _number(observations.get("reconnect_reconnected_at"))
     if disconnected is None or reconnected is None:
         failures.append("missing_reconnect_cycle")
-    elif reconnected < disconnected:
+    elif reconnected <= disconnected:
         failures.append("invalid_reconnect_observation_order")
     elif not start_time <= disconnected <= reconnected <= end_time:
         failures.append("reconnect_outside_evidence_window")

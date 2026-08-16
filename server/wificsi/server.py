@@ -122,12 +122,10 @@ def _metrics_row(
                 for kind in MessageType
             }
     elif previous is None:
-        sample_started_at = server_run_started_at
-        interval = observed_at - sample_started_at
-        csi_delta = csi_count
-        csi_rate = csi_delta / interval if interval > 0 else None
-        if interval <= 0:
-            interval = None
+        sample_started_at = None
+        interval = None
+        csi_delta = 0
+        csi_rate = None
         message_deltas = {kind.name: counts[kind] for kind in MessageType}
     else:
         sample_started_at = None

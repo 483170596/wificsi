@@ -149,13 +149,13 @@ def test_server_metrics_capture_simulated_link_health_without_raw_csi(tmp_path):
         port = reservation.getsockname()[1]
         reservation.close()
         server = asyncio.create_task(
-            run_server("127.0.0.1", port, duration=1.1, metrics_jsonl=metrics_path)
+            run_server("127.0.0.1", port, duration=2.1, metrics_jsonl=metrics_path)
         )
         await asyncio.sleep(0.02)
         await run_simulator(
             SimulatorConfig(
                 host="127.0.0.1", port=port, node_id=NODE_ID, rate=40.0,
-                duration=1.0, csi_lengths=(8, 128), hello_interval=0.05,
+                duration=2.0, csi_lengths=(8, 128), hello_interval=0.05,
                 state_interval=0.05, heartbeat_interval=0.05, boot_id=0x10203040,
             )
         )
@@ -168,9 +168,10 @@ def test_server_metrics_capture_simulated_link_health_without_raw_csi(tmp_path):
     assert rows[-1]["node_id"] == "28:84:85:87:2b:f4"
     assert rows[-1]["message_counts"]["CSI_FRAME"] >= 30
     assert rows[-1]["parse_errors"] == 0
+    assert rows[0]["sample_interval"] is None
     measured = [row for row in rows if row["sample_interval"] is not None]
     assert measured[-1]["csi_rate"] == measured[-1]["csi_delta"] / measured[-1]["sample_interval"]
-    assert measured[-1]["message_deltas"]["CSI_FRAME"] > 0
+    assert any(row["message_deltas"]["CSI_FRAME"] > 0 for row in measured)
     assert rows[-1]["observed_at"] > 0
     assert rows[-1]["server_run_started_at"] <= rows[-1]["observed_at"]
     assert "iq" not in rows[-1]

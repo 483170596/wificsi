@@ -22,6 +22,7 @@ OTHER_NODE_ID = "02:aa:bb:cc:dd:ee"
 
 def _metric(observed_at, *, state="INACTIVE", sample_interval=1.0, csi_rate=43.88,
             message_deltas=None, command_results=None, **changes):
+    csi_delta = 0 if csi_rate is None or sample_interval is None else sample_interval * csi_rate
     value = {
         "observed_at": observed_at,
         "server_run_started_at": observed_at - 1,
@@ -35,9 +36,9 @@ def _metric(observed_at, *, state="INACTIVE", sample_interval=1.0, csi_rate=43.8
             "HELLO": 2, "CSI_FRAME": 100, "SENSING_STATE": 2,
             "HEARTBEAT": 2, "COMMAND_ACK": 2,
         },
-        "message_deltas": message_deltas or {"CSI_FRAME": 44},
+        "message_deltas": {"CSI_FRAME": csi_delta} if message_deltas is None else message_deltas,
         "sample_interval": sample_interval,
-        "csi_delta": 1097 if csi_rate is not None else 0,
+        "csi_delta": csi_delta,
         "csi_rate": csi_rate,
         "device_queue_dropped": 0,
         "device_send_errors": 0,
@@ -54,7 +55,8 @@ def _metric(observed_at, *, state="INACTIVE", sample_interval=1.0, csi_rate=43.8
 
 def _passing_inputs():
     resumed = {"HELLO": 1, "CSI_FRAME": 1, "SENSING_STATE": 1, "HEARTBEAT": 1}
-    metrics = []
+    metrics = [_metric(1000, state="ACTIVE", sample_interval=None, csi_rate=None,
+                       message_deltas=resumed, server_run_started_at=1000)]
     for observed_at in (1025, 1050, 1075, 1100):
         metrics.append(_metric(
             observed_at, state="ACTIVE" if observed_at == 1025 else "INACTIVE",
@@ -71,7 +73,8 @@ def _passing_inputs():
     for observed_at in range(1325, 1676, 25):
         metrics.append(_metric(
             observed_at, sample_interval=25.0, sample_started_at=observed_at - 25,
-            server_run_started_at=1111, message_deltas=resumed if observed_at == 1325 else {"CSI_FRAME": 44},
+            server_run_started_at=1111,
+            message_deltas={**resumed, "CSI_FRAME": 1097} if observed_at == 1325 else None,
         ))
     metrics[-1]["command_results"] = [
         {"node_id": NODE_ID, "opcode": "GET_CONFIG", "ok": True, "attempts": 1},
@@ -124,6 +127,34 @@ def test_duration_excludes_silent_target_intervals_even_when_the_wall_span_is_60
     assert "duration_below_600_seconds" in result.failures
 
 
+def test_first_target_sample_cannot_credit_pre_discovery_server_time():
+    metrics, observations = _passing_inputs()
+    metrics.pop(0)
+
+    assert "pre_discovery_sample_interval" in validate(metrics, observations).failures
+
+
+def test_overlapping_target_intervals_are_rejected_even_when_they_total_600_seconds():
+    metrics, observations = _passing_inputs()
+    measured = [row for row in metrics if row.get("sample_interval")]
+    measured[1]["sample_started_at"] = measured[0]["observed_at"] - 15
+    measured[1]["sample_interval"] = measured[1]["observed_at"] - measured[1]["sample_started_at"]
+    measured[1]["csi_delta"] = measured[1]["sample_interval"] * measured[1]["csi_rate"]
+    measured[1]["message_deltas"]["CSI_FRAME"] = measured[1]["csi_delta"]
+
+    assert "overlapping_sample_intervals" in validate(metrics, observations).failures
+
+
+def test_csi_delta_must_match_the_reported_csi_message_delta():
+    metrics, observations = _passing_inputs()
+    measured = next(row for row in metrics if row.get("sample_interval"))
+    measured["csi_delta"] = 1_000_000
+    measured["csi_rate"] = measured["csi_delta"] / measured["sample_interval"]
+    measured["message_deltas"]["CSI_FRAME"] = 1
+
+    assert "csi_delta_message_delta_mismatch" in validate(metrics, observations).failures
+
+
 def test_reconnect_requires_deltas_strictly_after_the_observed_resume_time():
     metrics, observations = _passing_inputs()
     for row in metrics:
@@ -139,6 +170,13 @@ def test_reversed_reconnect_timestamps_report_the_order_failure_first():
     metrics, observations = _passing_inputs()
     observations["reconnect_disconnected_at"] = 1400
     observations["reconnect_reconnected_at"] = 1300
+
+    assert "invalid_reconnect_observation_order" in validate(metrics, observations).failures
+
+
+def test_zero_length_reconnect_observation_is_rejected():
+    metrics, observations = _passing_inputs()
+    observations["reconnect_disconnected_at"] = observations["reconnect_reconnected_at"]
 
     assert "invalid_reconnect_observation_order" in validate(metrics, observations).failures
 
@@ -313,8 +351,13 @@ def test_accelerated_simulator_fault_matrix_recovers_then_validates_real_timesta
     assert {row["boot_id"] for row in target_rows} == {0x10203040}
     assert any(
         row["observed_at"] < observations["server_stopped_at"]
+        and row["sample_started_at"] is not None
         and row["sample_started_at"] >= observations["reconnect_reconnected_at"]
         and row["message_deltas"]["HELLO"] > 0
         for row in target_rows
     )
-    assert any(row["sample_started_at"] >= observations["reconnect_reconnected_at"] for row in target_rows)
+    assert any(
+        row["sample_started_at"] is not None
+        and row["sample_started_at"] >= observations["reconnect_reconnected_at"]
+        for row in target_rows
+    )
