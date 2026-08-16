@@ -117,12 +117,15 @@ def summarize_csi(lines: Iterable[str]) -> CsiSummary:
     )
     peak_frames_per_second = 0
     if frames:
-        first_timestamp = frames[0].local_timestamp_us
-        buckets = Counter(
-            max(0, frame.local_timestamp_us - first_timestamp) // 1_000_000
-            for frame in frames
-        )
-        peak_frames_per_second = max(buckets.values())
+        timestamps = sorted(frame.local_timestamp_us for frame in frames)
+        window_start = 0
+        for window_end, timestamp in enumerate(timestamps):
+            while timestamp - timestamps[window_start] >= 1_000_000:
+                window_start += 1
+            peak_frames_per_second = max(
+                peak_frames_per_second,
+                window_end - window_start + 1,
+            )
 
     return CsiSummary(
         frames=len(frames),
@@ -170,11 +173,17 @@ def stage_gate(
     sensing: SensingSummary,
     *,
     minimum_csi_frames: int,
+    minimum_csi_duration_seconds: float = 60.0,
 ) -> GateResult:
     failures: list[str] = []
     if csi.frames < minimum_csi_frames:
         failures.append(
             f"valid CSI frames {csi.frames} below minimum {minimum_csi_frames}"
+        )
+    if csi.duration_seconds < minimum_csi_duration_seconds:
+        failures.append(
+            f"CSI duration {csi.duration_seconds:.3f}s below minimum "
+            f"{minimum_csi_duration_seconds:.3f}s"
         )
     if not csi.lengths:
         failures.append("no CSI lengths observed")
@@ -199,6 +208,7 @@ def _build_parser() -> argparse.ArgumentParser:
     csi_parser = subparsers.add_parser("csi", help="summarize raw CSI evidence")
     csi_parser.add_argument("log", type=Path)
     csi_parser.add_argument("--min-frames", type=int, default=100)
+    csi_parser.add_argument("--min-duration-seconds", type=float, default=60.0)
 
     sensing_parser = subparsers.add_parser(
         "sensing", help="summarize official AP sensing events"
@@ -211,6 +221,7 @@ def _build_parser() -> argparse.ArgumentParser:
     gate_parser.add_argument("--csi-log", type=Path, required=True)
     gate_parser.add_argument("--sensing-log", type=Path, required=True)
     gate_parser.add_argument("--min-frames", type=int, default=100)
+    gate_parser.add_argument("--min-duration-seconds", type=float, default=60.0)
     return parser
 
 
@@ -222,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(asdict(csi), ensure_ascii=False, sort_keys=True))
         return 0 if (
             csi.frames >= args.min_frames
+            and csi.duration_seconds >= args.min_duration_seconds
             and bool(csi.lengths)
             and csi.sample_rate_hz > 0
         ) else 1
@@ -237,7 +249,12 @@ def main(argv: list[str] | None = None) -> int:
 
     csi = summarize_csi(_read_lines(args.csi_log))
     sensing = summarize_sensing(_read_lines(args.sensing_log))
-    result = stage_gate(csi, sensing, minimum_csi_frames=args.min_frames)
+    result = stage_gate(
+        csi,
+        sensing,
+        minimum_csi_frames=args.min_frames,
+        minimum_csi_duration_seconds=args.min_duration_seconds,
+    )
     print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
     return 0 if result.passed else 1
 

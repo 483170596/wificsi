@@ -26,6 +26,10 @@ uv run python tools/baseline_validate.py stage-gate `
   --sensing-log .artifacts/sensing-com8.log
 ```
 
+The validator requires at least 100 valid frames and 60 seconds of valid CSI
+timestamps by default, plus at least one official AP `ACTIVE` and `INACTIVE`
+event.
+
 ## Verified versions
 
 - ESP-IDF v5.4.4

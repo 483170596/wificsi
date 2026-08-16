@@ -2,8 +2,9 @@
 
 ## Decision
 
-`PASS` — the combined gate accepted 728 valid official router-CSI frames and
-observed both official AP-channel states (`36 ACTIVE`, `36 INACTIVE`) on COM8.
+`PASS` — the combined gate accepted 5,766 valid official router-CSI frames over
+65.677 seconds and observed both official AP-channel states (`36 ACTIVE`,
+`36 INACTIVE`) on COM8.
 This pass authorizes the next Target-1 stage only; it does not validate static
 person detection, movement classification, or fall detection.
 
@@ -29,14 +30,13 @@ person detection, movement classification, or fall detection.
 ## Raw Router CSI
 
 - Official example: `examples/get-started/csi_recv_router`
-- Capture duration: 19.679613 seconds of valid device timestamps within a
-  25-second host capture
-- Valid/invalid CSI lines: 728 / 1; the invalid line was the partial frame at
-  the bounded capture edge
-- CSI length histogram: 128 bytes × 728 frames
-- Sustained sample rate: 36.9418 frames/s
-- Peak one-second volume: 40 frames
-- RSSI range: -22 to -18 dBm
+- Capture duration: 65.677460 seconds of valid device timestamps within an
+  80-second host capture; this exceeds the automated 60-second minimum
+- Valid/invalid CSI lines: 5,766 / 0
+- CSI length histogram: 128 bytes × 5,766 frames
+- Sustained sample rate: 87.7775 frames/s
+- Peak rolling one-second volume: 131 frames
+- RSSI range: -85 to -76 dBm
 - `first_word_invalid` frames: 0
 - Observed source MACs/channels: one AP BSSID, channel 4
 
@@ -64,10 +64,10 @@ person detection, movement classification, or fall detection.
 
 - The custom protocol must accept the observed 128-byte CSI payload and retain
   a variable-length field; it must not hard-code 128 as the only legal length.
-- Initial throughput assumption: 36.94 sustained frames/s and at least
-  40 frames/s peak per node under this AP and placement.
-- Queue sizing input: at least 80 frames for two seconds at the observed peak;
-  160 frames per node is the recommended initial headroom before measured
+- Initial throughput assumption: 87.78 sustained frames/s and at least
+  131 frames/s rolling peak per node under this AP and placement.
+- Queue sizing input: at least 262 frames for two seconds at the observed peak;
+  512 frames per node is the recommended initial headroom before measured
   server-side backpressure tests.
 - Public serial diagnostics confirmed in the official component include
   `jitter_value`, `wander_value`, `smooth_scaled`, `enter_level_scaled`,

@@ -47,9 +47,10 @@ def test_summary_reports_rssi_first_word_and_peak_one_second_volume():
     frames = [
         VALID_CSI,
         VALID_CSI.replace("-42,11", "-55,11")
-        .replace("2751923", "2771923")
+        .replace("2751923", "3651923")
         .replace(',8,0,"[', ',8,1,"['),
         VALID_CSI.replace("-42,11", "-48,11").replace("2751923", "3851923"),
+        VALID_CSI.replace("-42,11", "-46,11").replace("2751923", "3951923"),
     ]
 
     summary = summarize_csi(frames)
@@ -57,7 +58,7 @@ def test_summary_reports_rssi_first_word_and_peak_one_second_volume():
     assert summary.rssi_min == -55
     assert summary.rssi_max == -42
     assert summary.first_word_invalid_frames == 1
-    assert summary.peak_frames_per_second == 2
+    assert summary.peak_frames_per_second == 3
 
 
 def test_parse_csi_line_rejects_non_boolean_first_word_flag():
@@ -102,10 +103,41 @@ def test_stage_gate_requires_real_volume_and_both_states():
         ]
     )
 
-    result = stage_gate(csi, sensing, minimum_csi_frames=100)
+    result = stage_gate(
+        csi,
+        sensing,
+        minimum_csi_frames=100,
+        minimum_csi_duration_seconds=1.0,
+    )
 
     assert result.passed is True
     assert result.failures == ()
+
+
+def test_stage_gate_rejects_csi_capture_shorter_than_minimum_duration():
+    frames = [
+        VALID_CSI.replace("2751923", str(2_751_923 + index * 1_000_000))
+        for index in range(60)
+    ]
+    csi = summarize_csi(frames)
+    sensing = summarize_sensing(
+        [
+            "I (1000) wifi_sensing_demo: [AP] ACTIVE "
+            "peer=aa:bb:cc:dd:ee:ff data=17",
+            "I (2000) wifi_sensing_demo: [AP] INACTIVE "
+            "peer=aa:bb:cc:dd:ee:ff",
+        ]
+    )
+
+    result = stage_gate(
+        csi,
+        sensing,
+        minimum_csi_frames=1,
+        minimum_csi_duration_seconds=60.0,
+    )
+
+    assert result.passed is False
+    assert "CSI duration 59.000s below minimum 60.000s" in result.failures
 
 
 def test_stage_gate_cli_prints_json_and_exits_zero(tmp_path: Path):
@@ -141,6 +173,8 @@ def test_stage_gate_cli_prints_json_and_exits_zero(tmp_path: Path):
             str(sensing_log),
             "--min-frames",
             "100",
+            "--min-duration-seconds",
+            "1",
         ],
         check=False,
         capture_output=True,
@@ -168,6 +202,8 @@ def test_stage_gate_cli_exits_one_with_measured_failures(tmp_path: Path):
             str(sensing_log),
             "--min-frames",
             "100",
+            "--min-duration-seconds",
+            "1",
         ],
         check=False,
         capture_output=True,
@@ -198,6 +234,8 @@ def test_csi_cli_prints_summary_and_honors_minimum(tmp_path: Path):
             str(csi_log),
             "--min-frames",
             "2",
+            "--min-duration-seconds",
+            "0.01",
         ],
         check=False,
         capture_output=True,
