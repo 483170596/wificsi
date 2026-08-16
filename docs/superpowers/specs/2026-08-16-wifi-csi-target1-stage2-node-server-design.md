@@ -45,7 +45,7 @@ flowchart LR
     AP["PRTS router"]
 
     subgraph Node["ESP32-S3 node"]
-        RX["Official CSI callback"]
+        RX["esp-radar raw CSI tap"]
         FSM["esp_wifi_sensing FSM"]
         Q["FreeRTOS queue: 512 frames"]
         TX["UDP task and command receiver"]
@@ -67,12 +67,17 @@ flowchart LR
     UDP -->|"bounded command retries"| TX
 ```
 
-The Wi-Fi callback never formats text, allocates an unbounded object, sends a
-socket packet, or waits. It copies one validated frame into a 512-entry queue
-with zero wait. A dedicated task owns encoding and UDP transmission. When the
-queue is full, the newest CSI frame is dropped and `queue_dropped` increments;
-state and heartbeat snapshots use a separate small control queue so CSI load
-cannot starve health reporting.
+`esp_wifi_sensing` and `esp-radar` own ESP-IDF's single driver-level CSI
+callback. The application therefore does not call `esp_wifi_set_csi_rx_cb` a
+second time. After the FSM creates the radar pipeline, it uses the public
+`esp_radar_get_config` / `esp_radar_change_config` path to attach one
+`csi_filtered_cb`, then copies `wifi_csi_filtered_info_t.raw_data` and the
+original `info` metadata. This tap never formats text, allocates an unbounded
+object, sends a socket packet, or waits. It copies one validated frame into a
+512-entry queue with zero wait. A dedicated task owns encoding and UDP
+transmission. When the queue is full, the newest CSI frame is dropped and
+`queue_dropped` increments; state and heartbeat snapshots use a separate small
+control queue so CSI load cannot starve health reporting.
 
 The server is a single Python process for Stage 2, but protocol parsing, node
 state, UDP I/O, simulator, and CLI entry points remain separate modules. Stage
@@ -96,7 +101,7 @@ The approved 40-byte common header is unchanged:
 | 5 | 1 | minor | `0` |
 | 6 | 1 | message_type | Section 4.2 |
 | 7 | 1 | flags | zero in v1 |
-| 8 | 2 | header_length | `40` |
+| 8 | 2 | header_length | v1.0 sender writes `40` |
 | 10 | 2 | payload_length | exact payload byte count |
 | 12 | 6 | node_id | Wi-Fi STA MAC |
 | 18 | 2 | reserved | sender writes zero |
@@ -105,10 +110,13 @@ The approved 40-byte common header is unchanged:
 | 28 | 8 | device_time_us | monotonic microseconds since boot |
 | 36 | 4 | crc32 | IEEE CRC-32 over zeroed-CRC header plus payload |
 
-`header_length + payload_length` must equal the UDP datagram length. Unknown
-major versions, invalid lengths, bad CRC, a zero `boot_id`, and datagrams over
-1200 bytes are rejected without modifying node state. A higher minor version
-with major 1 is accepted only when known fields and lengths remain valid.
+`header_length + payload_length` must equal the UDP datagram length. A v1.0
+packet requires a 40-byte header. For a higher minor version under major 1,
+`header_length` may exceed 40 and the receiver skips the extension bytes before
+decoding the known payload. Unknown major versions, headers shorter than 40,
+invalid lengths, bad CRC, a zero `boot_id`, and datagrams over 1200 bytes are
+rejected without modifying node state. Reserved storage bytes are ignored by
+the receiver and written as zero when it re-encodes known messages.
 
 ### 4.2 Message values
 
@@ -235,9 +243,14 @@ COMMAND_ACK uses an 8-byte prefix: correlation ID `uint32`, echoed opcode
 append the same 16-byte config body; RESET has no body.
 
 The server sends a command to the source address and port of the last valid
-node datagram. It retries after 500 ms and 1000 ms, then fails after the third
-total send. The node caches the last 16 `(boot_id, correlation_id)` results and
-returns the cached ACK for duplicates without reapplying the operation.
+node datagram. A COMMAND header contains the target node ID and the target's
+currently observed boot ID; its header sequence equals the correlation ID and
+its device time is zero. Retries resend identical bytes after 500 ms and 1000
+ms, then fail after the third total send. The node rejects a command for a
+different node or boot. A COMMAND_ACK uses the node's normal outgoing sequence
+and device time. The node caches the last 16 `(boot_id, correlation_id)`
+results and returns the cached ACK for duplicates without reapplying the
+operation.
 
 ## 5. Node Runtime Behavior
 
@@ -303,8 +316,8 @@ Automated tests must cover:
 - exact fixed byte vectors for common header, CRC, and each payload;
 - C encoder output matching the Python vectors;
 - variable legal CSI lengths and rejection of mismatches/oversize payloads;
-- bad magic, version, flags, lengths, enum, reserved field, CRC, and zero boot
-  ID rejection;
+- bad magic, major version, flags, lengths, enum, CRC, and zero boot ID
+  rejection, plus higher-minor extension and ignored-reserved-byte acceptance;
 - sequence gap, duplicate, out-of-order, boot change, and uint32 wrap behavior;
 - simulator ACTIVE/INACTIVE snapshots and current-state replacement;
 - corrupted traffic not terminating ingest;
@@ -352,7 +365,10 @@ uses the public `esp_wifi_sensing` APIs already confirmed in Stage 1:
 - `ESP_WIFI_SENSING_FSM_CTRL_RESET_BASELINE`;
 - router-ping assisted sampling.
 
-The CSI callback rules and `wifi_csi_info_t` fields follow ESP-IDF v5.4.4. The
-project does not copy code or claims from RuView. WaveSight and ESPectre remain
-engineering references only; neither replaces the official sensing path or
-provides Stage 2 acceptance evidence.
+The CSI callback rules and `wifi_csi_info_t` fields follow ESP-IDF v5.4.4. Raw
+CSI telemetry is tapped through the public `wifi_csi_filtered_info_t` callback
+owned by `esp-radar`, preserving `raw_len`, `raw_data`, and original
+`wifi_csi_info_t` metadata without replacing the official driver's callback.
+The project does not copy code or claims from RuView. WaveSight and ESPectre
+remain engineering references only; neither replaces the official sensing
+path or provides Stage 2 acceptance evidence.
