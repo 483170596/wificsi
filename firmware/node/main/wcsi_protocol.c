@@ -69,6 +69,18 @@ static float get_float(const uint8_t *input)
     return value;
 }
 
+static uint32_t datagram_crc(const uint8_t *datagram, size_t length)
+{
+    static const uint8_t zero_crc[4] = {0};
+    uint32_t crc = esp_crc32_le(0, datagram, WCSI_CRC_OFFSET);
+    crc = esp_crc32_le(crc, zero_crc, sizeof(zero_crc));
+    if (length > WCSI_HEADER_SIZE) {
+        crc = esp_crc32_le(crc, datagram + WCSI_HEADER_SIZE,
+                           (uint32_t)(length - WCSI_HEADER_SIZE));
+    }
+    return crc;
+}
+
 static bool valid_message_type(wcsi_message_type_t message_type)
 {
     return message_type >= WCSI_MESSAGE_HELLO && message_type <= WCSI_MESSAGE_COMMAND_ACK;
@@ -146,8 +158,7 @@ static esp_err_t finish_packet(const wcsi_header_t *header, uint16_t payload_len
         return error;
     }
     size_t length = WCSI_HEADER_SIZE + payload_length;
-    put_u32(output + WCSI_CRC_OFFSET, 0);
-    put_u32(output + WCSI_CRC_OFFSET, esp_crc32_le(0, output, (uint32_t)length));
+    put_u32(output + WCSI_CRC_OFFSET, datagram_crc(output, length));
     *output_length = length;
     return ESP_OK;
 }
@@ -279,7 +290,7 @@ static esp_err_t validate_datagram(const uint8_t *datagram, size_t length,
         return ESP_ERR_INVALID_SIZE;
     }
     if (memcmp(datagram, "WCSI", 4) != 0 || datagram[4] != 1 || datagram[7] != 0 ||
-        get_u16(datagram + 18) != 0 || !valid_message_type((wcsi_message_type_t)datagram[6])) {
+        !valid_message_type((wcsi_message_type_t)datagram[6])) {
         return ESP_ERR_INVALID_ARG;
     }
     uint16_t decoded_header_length = get_u16(datagram + 8);
@@ -290,11 +301,8 @@ static esp_err_t validate_datagram(const uint8_t *datagram, size_t length,
         get_u32(datagram + 20) == 0) {
         return ESP_ERR_INVALID_SIZE;
     }
-    uint8_t copy[WCSI_MAX_DATAGRAM];
-    memcpy(copy, datagram, length);
-    uint32_t received_crc = get_u32(copy + WCSI_CRC_OFFSET);
-    put_u32(copy + WCSI_CRC_OFFSET, 0);
-    if (esp_crc32_le(0, copy, (uint32_t)length) != received_crc) {
+    uint32_t received_crc = get_u32(datagram + WCSI_CRC_OFFSET);
+    if (datagram_crc(datagram, length) != received_crc) {
         return ESP_ERR_INVALID_CRC;
     }
     if (header != NULL) {
@@ -333,10 +341,14 @@ esp_err_t wcsi_decode_command(const uint8_t *datagram, size_t length,
         return ESP_ERR_INVALID_SIZE;
     }
     const uint8_t *body = datagram + header_length;
-    if (!valid_opcode(body[4]) || body[5] != 0 || body[6] != 0 || body[7] != 0) {
+    if (!valid_opcode(body[4])) {
         return ESP_ERR_INVALID_ARG;
     }
-    command->correlation_id = get_u32(body);
+    uint32_t correlation_id = get_u32(body);
+    if (header->sequence != correlation_id || header->device_time_us != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    command->correlation_id = correlation_id;
     command->opcode = (wcsi_command_opcode_t)body[4];
     command->has_config = payload_length == WCSI_COMMAND_PREFIX_SIZE + WCSI_CONFIG_SIZE;
     if ((command->opcode == WCSI_COMMAND_SET_CONFIG) != command->has_config) {
@@ -354,8 +366,13 @@ esp_err_t wcsi_encode_ack(const wcsi_header_t *header, const wcsi_ack_t *payload
                           uint8_t *output, size_t capacity, size_t *output_length)
 {
     if (payload == NULL || !valid_opcode((uint8_t)payload->opcode) ||
-        payload->status > WCSI_ACK_INTERNAL_ERROR ||
-        (payload->config != NULL && payload->opcode == WCSI_COMMAND_RESET_BASELINE)) {
+        payload->status > WCSI_ACK_INTERNAL_ERROR) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    bool config_required = payload->status == WCSI_ACK_OK &&
+                           (payload->opcode == WCSI_COMMAND_GET_CONFIG ||
+                            payload->opcode == WCSI_COMMAND_SET_CONFIG);
+    if ((payload->config != NULL) != config_required) {
         return ESP_ERR_INVALID_ARG;
     }
     size_t payload_length = WCSI_ACK_PREFIX_SIZE +
@@ -404,6 +421,11 @@ static esp_err_t expect_vector(const char *name, const uint8_t *actual, size_t a
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+static void refresh_test_crc(uint8_t *datagram, size_t length)
+{
+    put_u32(datagram + WCSI_CRC_OFFSET, datagram_crc(datagram, length));
 }
 
 esp_err_t wcsi_protocol_self_test(void)
@@ -490,6 +512,60 @@ esp_err_t wcsi_protocol_self_test(void)
     if (wcsi_encode_ack(&header, &ack, output, sizeof(output), &length) != ESP_OK ||
         expect_vector("GET_CONFIG_ACK", output, length, WCSI_VECTOR_GET_CONFIG_ACK,
                       WCSI_VECTOR_GET_CONFIG_ACK_LEN) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    uint8_t malformed[WCSI_VECTOR_GET_CONFIG_LEN];
+    memcpy(malformed, WCSI_VECTOR_GET_CONFIG, sizeof(malformed));
+    malformed[WCSI_HEADER_SIZE] ^= 1;
+    if (wcsi_decode_command(malformed, sizeof(malformed), &header, &command) != ESP_ERR_INVALID_CRC) {
+        ESP_LOGE(TAG, "corrupt CRC was accepted");
+        return ESP_FAIL;
+    }
+    memcpy(malformed, WCSI_VECTOR_GET_CONFIG, sizeof(malformed));
+    malformed[19] = 1;
+    malformed[WCSI_HEADER_SIZE + 5] = 1;
+    refresh_test_crc(malformed, sizeof(malformed));
+    if (wcsi_decode_command(malformed, sizeof(malformed), &header, &command) != ESP_OK) {
+        ESP_LOGE(TAG, "reserved storage bytes were rejected");
+        return ESP_FAIL;
+    }
+    memcpy(malformed, WCSI_VECTOR_GET_CONFIG, sizeof(malformed));
+    put_u32(malformed + 24, 9);
+    refresh_test_crc(malformed, sizeof(malformed));
+    if (wcsi_decode_command(malformed, sizeof(malformed), &header, &command) != ESP_ERR_INVALID_ARG) {
+        ESP_LOGE(TAG, "command sequence mismatch was accepted");
+        return ESP_FAIL;
+    }
+    memcpy(malformed, WCSI_VECTOR_GET_CONFIG, sizeof(malformed));
+    put_u64(malformed + 28, 1);
+    refresh_test_crc(malformed, sizeof(malformed));
+    if (wcsi_decode_command(malformed, sizeof(malformed), &header, &command) != ESP_ERR_INVALID_ARG) {
+        ESP_LOGE(TAG, "command device time was accepted");
+        return ESP_FAIL;
+    }
+    memcpy(malformed, WCSI_VECTOR_GET_CONFIG, sizeof(malformed));
+    malformed[WCSI_HEADER_SIZE + 4] = 0xff;
+    refresh_test_crc(malformed, sizeof(malformed));
+    if (wcsi_decode_command(malformed, sizeof(malformed), &header, &command) != ESP_ERR_INVALID_ARG) {
+        ESP_LOGE(TAG, "unknown command opcode was accepted");
+        return ESP_FAIL;
+    }
+    wcsi_header_t hello_header = vector_header(1, 1000000, WCSI_MESSAGE_HELLO);
+    if (wcsi_encode_hello(&hello_header, &hello, output, WCSI_VECTOR_HELLO_LEN - 1,
+                          &length) != ESP_ERR_INVALID_SIZE) {
+        ESP_LOGE(TAG, "undersized output capacity was accepted");
+        return ESP_FAIL;
+    }
+    wcsi_header_t csi_header = vector_header(2, 2000000, WCSI_MESSAGE_CSI_FRAME);
+    csi.iq_length = 0;
+    if (wcsi_encode_csi(&csi_header, &csi, output, sizeof(output), &length) != ESP_ERR_INVALID_ARG) {
+        ESP_LOGE(TAG, "zero-length CSI was accepted");
+        return ESP_FAIL;
+    }
+    ack.config = NULL;
+    if (wcsi_encode_ack(&header, &ack, output, sizeof(output), &length) != ESP_ERR_INVALID_ARG) {
+        ESP_LOGE(TAG, "successful GET_CONFIG ACK without config was accepted");
         return ESP_FAIL;
     }
     return ESP_OK;

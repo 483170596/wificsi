@@ -444,7 +444,8 @@ the payload, compute
 ESP-IDF 5.4.4 this API performs the initial and final complement internally;
 the zero seed therefore matches Python `zlib.crc32` and the committed vectors.
 Reject null pointers, zero/oversize CSI, output-capacity shortage, unknown
-command opcode, bad length, bad CRC, and nonzero reserved fields.
+command opcode, bad length, and bad CRC. Send reserved storage bytes as zero
+and ignore them on receive, as required by the WCSI v1 contract.
 
 - [ ] **Step 4: Build and run protocol self-test on COM8**
 

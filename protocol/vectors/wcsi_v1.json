@@ -30,16 +30,16 @@
   {
     "name": "get_config",
     "message_type": "COMMAND",
-    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 5, "device_time_us": 5000000},
+    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 7, "device_time_us": 0},
     "payload": {"correlation_id": 7, "opcode": 1},
-    "encoded_hex": "574353490100050000280008288485872bf40000102030400000000500000000004c4b40c785c5350000000701000000"
+    "encoded_hex": "574353490100050000280008288485872bf40000102030400000000700000000000000001f434b660000000701000000"
   },
   {
     "name": "set_config",
     "message_type": "COMMAND",
-    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 6, "device_time_us": 6000000},
+    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 8, "device_time_us": 0},
     "payload": {"correlation_id": 8, "opcode": 3, "config": [0.5, 0.25, 0.125, 300]},
-    "encoded_hex": "574353490100050000280018288485872bf40000102030400000000600000000005b8d805825e45400000008030000003f0000003e8000003e0000000000012c"
+    "encoded_hex": "574353490100050000280018288485872bf40000102030400000000800000000000000009c441dd600000008030000003f0000003e8000003e0000000000012c"
   },
   {
     "name": "get_config_ack",
