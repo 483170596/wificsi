@@ -1,0 +1,3 @@
+# One-shot local reconnect evidence for the Stage 2 acceptance image.
+CONFIG_WCSI_RECONNECT_SELF_TEST=y
+CONFIG_WCSI_RECONNECT_SELF_TEST_DELAY_MS=5000

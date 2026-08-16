@@ -27,6 +27,12 @@ FSM start, and baseline completion. The serial handle was closed at
 headless run found no `idf.py monitor`, pyserial, `SerialPort`, or esptool COM8
 holder.
 
+The acceptance configuration is reproducible without reusing that ignored
+configuration: `firmware/node/sdkconfig.acceptance.defaults` composes with
+`sdkconfig.defaults` into an ignored isolated SDKCONFIG/build directory and
+sets only the one-shot reconnect probe and its 5,000 ms delay. The complete
+two-run, measured-observation recipe is in `firmware/node/README.md`.
+
 The one-shot local reconnect probe was enabled for this image. In the final
 headless collector it was observed as the first zero-CSI sample at
 1786883808.1331775 and a new HELLO at 1786883812.1757283 (4.0425508 seconds
