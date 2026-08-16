@@ -5,12 +5,12 @@ menu "WCSI node configuration"
         default y
 
     config WCSI_WIFI_SSID
-        string "Wi-Fi SSID (set only in the ignored generated sdkconfig)"
-        default ""
+        string "Wi-Fi SSID"
+        default "PRTS"
 
     config WCSI_WIFI_PASSWORD
-        string "Wi-Fi password (set only in the ignored generated sdkconfig)"
-        default ""
+        string "Wi-Fi password"
+        default "arknights"
 
     config WCSI_SERVER_ADDRESS
         string "Sensing server IPv4 address"

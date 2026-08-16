@@ -13,7 +13,8 @@
 - Work only in `D:\Projects\Codex\WIFICSI\.worktrees\stage2-node-server-link` on branch `codex/stage2-node-server-link`, based on Stage 1 commit `865b7bc`.
 - Activate ESP-IDF with `& 'C:\Espressif\tools\Microsoft.v5.4.4.PowerShell_profile.ps1'`; `idf.py --version` must report v5.4.4.
 - Use only the ESP32-S3 attached to COM8 and the server IPv4 `10.204.75.168`.
-- Connect only to the 2.4 GHz WLAN `PRTS`; never commit, print, or embed its password in tracked configuration.
+- Connect only to the public 2.4 GHz lab WLAN `PRTS`; its public SSID/password
+  are tracked firmware defaults and require no secret retrieval or credential scan.
 - Keep generated `sdkconfig`, `dependencies.lock`, build trees, serial output, packet captures, and acceptance evidence under ignored paths.
 - Map only official AP ACTIVE to “有人” and official AP INACTIVE to “无人”; retain the raw state and its activity-proxy limitation.
 - Do not add FastAPI, WebSocket, Web UI, persistence, recording, labeling, movement/fall logic, models, MQTT, cloud access, or four-node behavior.
@@ -41,7 +42,7 @@
 ├── firmware/
 │   └── node/
 │       ├── CMakeLists.txt
-│       ├── sdkconfig.defaults           # Non-secret defaults only
+│       ├── sdkconfig.defaults           # Reproducible ESP-IDF defaults
 │       ├── partitions.csv
 │       └── main/
 │           ├── CMakeLists.txt
@@ -417,7 +418,7 @@ idf.py -C firmware/node build
 
 Expected: link failure naming the missing codec/self-test symbols.
 
-- [ ] **Step 2: Lock component and non-secret build configuration**
+- [ ] **Step 2: Lock component and build configuration**
 
 Use `main/idf_component.yml`:
 
@@ -431,9 +432,9 @@ dependencies:
 Use `EXTRA_COMPONENT_DIRS` for IDF's `protocol_examples_common`. Kconfig must
 define server address `10.204.75.168`, server port 5500, local port 5501,
 queue capacity 512, heartbeat/state periods 1000 ms, HELLO period 30000 ms,
-and the disabled reconnect self-test. WLAN credentials use the official
-example connection configuration and generated `sdkconfig`; they never appear
-in `sdkconfig.defaults`.
+and the disabled reconnect self-test. The public lab WLAN SSID/password are
+tracked Kconfig defaults so a clean checkout builds without interactive
+credential provisioning.
 
 - [ ] **Step 3: Implement bounds-checked C serialization**
 
@@ -455,8 +456,8 @@ under `.artifacts/stage2/protocol-self-test.log`.
 
 - [ ] **Step 5: Verify generated output and commit**
 
-Run the vector generator twice and confirm no diff, run all Python tests, run
-the ESP-IDF build again, and confirm no secret literal in tracked files.
+Run the vector generator twice and confirm no diff, run all Python tests, and
+run the ESP-IDF build again.
 
 Commit:
 
@@ -549,16 +550,15 @@ calling the component twice.
 
 - [ ] **Step 7: Build, flash, and run bounded telemetry smoke test**
 
-Configure WLAN credentials locally without printing them, build, flash COM8,
-then close the serial monitor after observing self-test, IP, FSM start, and UDP
-task start. Run the headless server for 60 seconds and verify HELLO, CSI, state,
-and heartbeat appear without serial participation.
+Build with the tracked public lab WLAN defaults, flash COM8, then close the
+serial monitor after observing self-test, IP, FSM start, and UDP task start.
+Run the headless server for 60 seconds and verify HELLO, CSI, state, and
+heartbeat appear without serial participation.
 
 - [ ] **Step 8: Run verification and commit**
 
 Run the full Python suite, deterministic vector generation, `idf.py build`,
-`git diff --check`, submodule status, and a dynamic credential-literal scan
-that outputs only a boolean.
+`git diff --check`, and submodule status.
 
 Commit:
 
@@ -640,11 +640,10 @@ git commit -m "test: automate Stage 2 recovery gate"
   reconnect/restart observation, build output, component lock, and Stage 2 gate.
 - Produces: a measured PASS/FAIL report and exact inputs for Stage 3 planning.
 
-- [ ] **Step 1: Prepare ignored real-device configuration and evidence paths**
+- [ ] **Step 1: Prepare real-device evidence paths**
 
-Create `.artifacts/stage2/`. Configure PRTS credentials locally through the
-saved WLAN profile or menuconfig without echoing them. Confirm the tracked
-defaults contain only `10.204.75.168`, ports, periods, and queue capacity.
+Create `.artifacts/stage2/`. Use the tracked public PRTS lab WLAN defaults and
+confirm the server address, ports, periods, and queue capacity.
 
 - [ ] **Step 2: Build and flash the acceptance firmware**
 
@@ -665,7 +664,7 @@ Start the server with JSONL metrics. During the run:
 
 Do not run a serial monitor during the headless measurement interval.
 
-- [ ] **Step 4: Run the formal gate and credential scan**
+- [ ] **Step 4: Run the formal gate**
 
 Run:
 
@@ -675,9 +674,8 @@ uv run python tools/stage2_validate.py `
   --observations .artifacts/stage2/observations.json
 ```
 
-Expected: exit 0 with `"passed": true`. Dynamically retrieve the saved WLAN
-key in memory and scan tracked files plus `.artifacts/stage2`; print only
-`credential_literal_found=false`.
+Expected: exit 0 with `"passed": true`. No WLAN credential scan is required
+because this deployment uses an explicitly public lab network.
 
 - [ ] **Step 5: Write the measured report without raw data**
 

@@ -5,7 +5,7 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 
-# ESP-IDF generated files and local secrets
+# ESP-IDF generated files and local overrides
 sdkconfig
 sdkconfig.old
 build/

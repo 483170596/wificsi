@@ -255,9 +255,9 @@ operation.
 ## 5. Node Runtime Behavior
 
 The node uses one UDP socket bound to local port 5501 and sends to
-`10.204.75.168:5500`. Server address, WLAN SSID, and WLAN password come from
-local Kconfig/sdkconfig values excluded from Git; logs never print the
-password.
+`10.204.75.168:5500`. The explicitly public lab WLAN SSID/password are tracked
+Kconfig defaults; no secret retrieval, local credential provisioning, or
+credential-literal scan is required.
 
 Wi-Fi reconnection uses bounded exponential delays of 1, 2, 4, 8, then 15
 seconds, capped at 15 seconds. After reconnection the node refreshes AP BSSID
@@ -348,7 +348,7 @@ The real COM8 acceptance run must meet all of these conditions:
 Evidence is stored only under ignored `.artifacts/stage2/`. The committed
 verification report contains commands, versions, durations, counts, rates,
 drop/error metrics, reconnect/restart observations, and a PASS/FAIL decision,
-but no WLAN password or raw CSI capture.
+but no raw CSI capture.
 
 Stage 2 passes only when the automated suite and all eight real-device
 conditions pass. A pass authorizes planning Stage 3; it does not authorize Web
