@@ -23,6 +23,13 @@ enum {
     WCSI_NODE_CONFIG_PAYLOAD_SIZE = 16,
 };
 
+#ifndef CONFIG_ESP_WIFI_CSI_ENABLED
+#error "The official sensing runtime requires CONFIG_ESP_WIFI_CSI_ENABLED"
+#else
+_Static_assert(CONFIG_ESP_WIFI_CSI_ENABLED == 1,
+               "The official sensing runtime requires Wi-Fi CSI support");
+#endif
+
 _Static_assert(WCSI_HEADER_SIZE == 40U, "WCSI header wire size changed");
 _Static_assert(WCSI_NODE_HELLO_PAYLOAD_SIZE == 24, "HELLO payload wire size changed");
 _Static_assert(WCSI_NODE_CSI_METADATA_SIZE == 36, "CSI metadata wire size changed");
