@@ -1,1 +1,13 @@
 .worktrees/
+.artifacts/
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# ESP-IDF generated files and local secrets
+sdkconfig
+sdkconfig.old
+build/
+managed_components/
+dependencies.lock
