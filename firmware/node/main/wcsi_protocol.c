@@ -563,9 +563,22 @@ esp_err_t wcsi_protocol_self_test(void)
         ESP_LOGE(TAG, "zero-length CSI was accepted");
         return ESP_FAIL;
     }
+    header = vector_header(7, 7000000, WCSI_MESSAGE_COMMAND_ACK);
     ack.config = NULL;
     if (wcsi_encode_ack(&header, &ack, output, sizeof(output), &length) != ESP_ERR_INVALID_ARG) {
         ESP_LOGE(TAG, "successful GET_CONFIG ACK without config was accepted");
+        return ESP_FAIL;
+    }
+    ack.status = WCSI_ACK_INVALID_ARGUMENT;
+    ack.config = &config;
+    if (wcsi_encode_ack(&header, &ack, output, sizeof(output), &length) != ESP_ERR_INVALID_ARG) {
+        ESP_LOGE(TAG, "failed GET_CONFIG ACK with config was accepted");
+        return ESP_FAIL;
+    }
+    ack.opcode = WCSI_COMMAND_RESET_BASELINE;
+    ack.status = WCSI_ACK_OK;
+    if (wcsi_encode_ack(&header, &ack, output, sizeof(output), &length) != ESP_ERR_INVALID_ARG) {
+        ESP_LOGE(TAG, "RESET_BASELINE ACK with config was accepted");
         return ESP_FAIL;
     }
     return ESP_OK;
