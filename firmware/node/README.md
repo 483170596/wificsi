@@ -39,8 +39,15 @@ $defaults = "$normalDefaults;$acceptanceDefaults"
 
 idf.py -C firmware/node -B $acceptanceBuild -DIDF_TARGET=esp32s3 `
   "-DSDKCONFIG=$acceptanceSdkconfig" "-DSDKCONFIG_DEFAULTS=$defaults" build
-Select-String -Path $acceptanceSdkconfig `
-  -Pattern '^CONFIG_WCSI_RECONNECT_SELF_TEST=y$','^CONFIG_WCSI_RECONNECT_SELF_TEST_DELAY_MS=5000$'
+$resolvedAcceptanceConfig = Get-Content -LiteralPath $acceptanceSdkconfig
+foreach ($requiredLine in @(
+  'CONFIG_WCSI_RECONNECT_SELF_TEST=y',
+  'CONFIG_WCSI_RECONNECT_SELF_TEST_DELAY_MS=5000'
+)) {
+  if ($resolvedAcceptanceConfig -notcontains $requiredLine) {
+    throw "acceptance SDKCONFIG missing exact line: $requiredLine"
+  }
+}
 idf.py -C firmware/node -B $acceptanceBuild -p COM8 flash
 ```
 
@@ -79,10 +86,19 @@ ignored aggregate metrics/logs.
 
 ```powershell
 $python = 'C:\Espressif\tools\python\v5.4.4\venv\Scripts\python.exe'
-$targetNode = 'aa:bb:cc:dd:ee:ff' # replace with the measured target MAC
+$targetNode = Read-Host 'Enter the measured six-byte STA MAC (for example 28:84:85:87:2b:f4)'
+if ($targetNode -notmatch '^(?i:[0-9a-f]{2}:){5}[0-9a-f]{2}$') { throw 'target MAC must be six colon-separated bytes' }
 $metrics = Join-Path (Get-Location) '.artifacts\stage2\server-metrics.jsonl'
 $server1Log = Join-Path (Get-Location) '.artifacts\stage2\server-1.log'
 $server1Err = Join-Path (Get-Location) '.artifacts\stage2\server-1.err'
+$server2Log = Join-Path (Get-Location) '.artifacts\stage2\server-2.log'
+$server2Err = Join-Path (Get-Location) '.artifacts\stage2\server-2.err'
+$observationPath = Join-Path (Get-Location) '.artifacts\stage2\observations.json'
+foreach ($evidencePath in @($metrics,$server1Log,$server1Err,$server2Log,$server2Err,$observationPath)) {
+  if (Test-Path -LiteralPath $evidencePath) {
+    throw "refusing to reuse stale acceptance evidence: $evidencePath"
+  }
+}
 $server1 = Start-Process -FilePath $python -ArgumentList @(
   '-m','wificsi.server','--host','10.204.75.168','--duration','330',
   '--metrics-jsonl',$metrics,'--get-config',$targetNode,'--reset-baseline',$targetNode
@@ -99,8 +115,6 @@ seconds of legitimate reporting.
 
 ```powershell
 Start-Sleep -Seconds 12
-$server2Log = Join-Path (Get-Location) '.artifacts\stage2\server-2.log'
-$server2Err = Join-Path (Get-Location) '.artifacts\stage2\server-2.err'
 $server2 = Start-Process -FilePath $python -ArgumentList @(
   '-m','wificsi.server','--host','10.204.75.168','--duration','330',
   '--metrics-jsonl',$metrics
@@ -109,26 +123,59 @@ $server2 = Start-Process -FilePath $python -ArgumentList @(
 Wait-Process -Id $server2.Id
 ```
 
-Derive observations only from the actual captured metric rows. For the local
-reconnect, use the actual first zero-CSI `observed_at` row and the actual
-subsequent HELLO-delta `observed_at` row from run 1. For restart discovery, use
-the first `message_deltas.HELLO > 0` row in run 2. Do not use planned times or
-fixed timestamps. The command below extracts the run-2 server-start and first
-HELLO observations; inspect the run-1 rows to fill the two reconnect values.
+Derive observations only from actual captured metric rows. The runnable
+detector below excludes uncredited/null first samples, requires a positive-CSI
+row followed by at least two consecutive credited zero-CSI rows, and accepts
+only one later row within ten seconds that contains both HELLO delta and
+resumed CSI. It throws rather than guessing if there are zero or multiple
+cycles. This is deliberately distinct from the restart detection, which uses
+the first HELLO delta in run 2.
 
 ```powershell
 $rows = Get-Content $metrics | ForEach-Object { $_ | ConvertFrom-Json }
 $targetRows = $rows | Where-Object { $_.node_id -eq $targetNode }
 $runs = $targetRows | Group-Object server_run_started_at | Sort-Object { [double]$_.Name }
 if ($runs.Count -ne 2) { throw 'expected exactly two server runs for target' }
+$run1Rows = @(
+  $runs[0].Group | Where-Object {
+    $null -ne $_.sample_started_at -and $null -ne $_.sample_interval -and
+    $null -ne $_.csi_delta -and $null -ne $_.message_deltas
+  } | Sort-Object { [double]$_.observed_at }
+)
+$cycles = [System.Collections.Generic.List[object]]::new()
+for ($index = 1; $index -lt $run1Rows.Count; $index++) {
+  $previous = $run1Rows[$index - 1]
+  $firstZero = $run1Rows[$index]
+  if ([int]$previous.csi_delta -le 0 -or [int]$firstZero.csi_delta -ne 0) { continue }
+
+  $zeroEnd = $index
+  while ($zeroEnd + 1 -lt $run1Rows.Count -and [int]$run1Rows[$zeroEnd + 1].csi_delta -eq 0) {
+    $zeroEnd++
+  }
+  if (($zeroEnd - $index + 1) -lt 2) { continue }
+
+  $resumedRows = @(
+    $run1Rows | Select-Object -Skip ($zeroEnd + 1) | Where-Object {
+      ([double]$_.observed_at - [double]$firstZero.observed_at) -le 10.0 -and
+      [int]$_.message_deltas.HELLO -gt 0 -and [int]$_.csi_delta -gt 0
+    }
+  )
+  if ($resumedRows.Count -gt 1) { throw 'ambiguous resumed-HELLO rows for one reconnect candidate' }
+  if ($resumedRows.Count -eq 1) {
+    $cycles.Add([pscustomobject]@{ first_zero = $firstZero; resumed = $resumedRows[0] })
+  }
+}
+if ($cycles.Count -ne 1) { throw "expected exactly one measured reconnect cycle, found $($cycles.Count)" }
+$reconnectDisconnectedAt = [double]$cycles[0].first_zero.observed_at
+$reconnectReconnectedAt = [double]$cycles[0].resumed.observed_at
 $serverStartedAt = [double]$runs[1].Name
 $serverRediscoveredAt = [double](
   $runs[1].Group | Where-Object { $_.message_deltas.HELLO -gt 0 } |
   Select-Object -First 1 -ExpandProperty observed_at
 )
-$reconnectDisconnectedAt = <actual run-1 first-zero-CSI observed_at>
-$reconnectReconnectedAt = <actual run-1 resumed-HELLO observed_at>
-if ($serverRediscoveredAt -le $serverStartedAt) { throw 'missing post-restart HELLO' }
+if ($serverRediscoveredAt -le $serverStartedAt -or $reconnectReconnectedAt -le $reconnectDisconnectedAt) {
+  throw 'missing or invalid recovery observation'
+}
 
 $observations = [ordered]@{
   target_node_id = $targetNode
@@ -138,7 +185,6 @@ $observations = [ordered]@{
   server_started_at = $serverStartedAt
   server_rediscovered_at = $serverRediscoveredAt
 }
-$observationPath = Join-Path (Get-Location) '.artifacts\stage2\observations.json'
 $observations | ConvertTo-Json -Compress | Set-Content -NoNewline $observationPath
 & $uv run python tools/stage2_validate.py --metrics $metrics --observations $observationPath
 ```

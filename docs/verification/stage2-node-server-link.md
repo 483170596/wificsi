@@ -31,7 +31,10 @@ The acceptance configuration is reproducible without reusing that ignored
 configuration: `firmware/node/sdkconfig.acceptance.defaults` composes with
 `sdkconfig.defaults` into an ignored isolated SDKCONFIG/build directory and
 sets only the one-shot reconnect probe and its 5,000 ms delay. The complete
-two-run, measured-observation recipe is in `firmware/node/README.md`.
+two-run, measured-observation recipe is in `firmware/node/README.md`. That
+recipe rejects stale evidence paths and automatically detects exactly one
+credited zero-CSI/recovered-HELLO reconnect cycle rather than accepting a
+run-start baseline or manually supplied timestamps.
 
 The one-shot local reconnect probe was enabled for this image. In the final
 headless collector it was observed as the first zero-CSI sample at
