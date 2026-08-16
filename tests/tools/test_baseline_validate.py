@@ -43,6 +43,23 @@ def test_summary_counts_length_mismatch_as_invalid():
     assert summary.lengths == {8: 1}
 
 
+def test_summary_reports_rssi_first_word_and_peak_one_second_volume():
+    frames = [
+        VALID_CSI,
+        VALID_CSI.replace("-42,11", "-55,11")
+        .replace("2751923", "2771923")
+        .replace(',8,0,"[', ',8,1,"['),
+        VALID_CSI.replace("-42,11", "-48,11").replace("2751923", "3851923"),
+    ]
+
+    summary = summarize_csi(frames)
+
+    assert summary.rssi_min == -55
+    assert summary.rssi_max == -42
+    assert summary.first_word_invalid_frames == 1
+    assert summary.peak_frames_per_second == 2
+
+
 def test_parse_csi_line_rejects_non_boolean_first_word_flag():
     invalid = VALID_CSI.replace(',8,0,"[', ',8,2,"[')
 

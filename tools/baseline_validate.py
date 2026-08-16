@@ -35,6 +35,10 @@ class CsiSummary:
     channels: tuple[int, ...]
     duration_seconds: float
     sample_rate_hz: float
+    peak_frames_per_second: int
+    rssi_min: int | None
+    rssi_max: int | None
+    first_word_invalid_frames: int
 
 
 @dataclass(frozen=True)
@@ -111,6 +115,14 @@ def summarize_csi(lines: Iterable[str]) -> CsiSummary:
     sample_rate_hz = (
         (len(frames) - 1) / duration_seconds if duration_seconds > 0 else 0.0
     )
+    peak_frames_per_second = 0
+    if frames:
+        first_timestamp = frames[0].local_timestamp_us
+        buckets = Counter(
+            max(0, frame.local_timestamp_us - first_timestamp) // 1_000_000
+            for frame in frames
+        )
+        peak_frames_per_second = max(buckets.values())
 
     return CsiSummary(
         frames=len(frames),
@@ -120,6 +132,10 @@ def summarize_csi(lines: Iterable[str]) -> CsiSummary:
         channels=tuple(sorted({frame.channel for frame in frames})),
         duration_seconds=duration_seconds,
         sample_rate_hz=sample_rate_hz,
+        peak_frames_per_second=peak_frames_per_second,
+        rssi_min=min((frame.rssi for frame in frames), default=None),
+        rssi_max=max((frame.rssi for frame in frames), default=None),
+        first_word_invalid_frames=sum(frame.first_word_invalid for frame in frames),
     )
 
 
