@@ -10,4 +10,4 @@ dev = ["pytest>=8.4,<9"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-pythonpath = ["."]
+pythonpath = [".", "server"]

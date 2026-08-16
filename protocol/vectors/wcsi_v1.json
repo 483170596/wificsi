@@ -1,0 +1,51 @@
+[
+  {
+    "name": "hello",
+    "message_type": "HELLO",
+    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 1, "device_time_us": 1000000},
+    "payload": {"chip_model": 1, "firmware": [1, 0, 0], "capabilities": 15, "max_csi_length": 612, "queue_capacity": 512, "heartbeat_interval_ms": 1000, "state_interval_ms": 1000, "listen_port": 5501, "ap_bssid": "5ee388d95b42"},
+    "encoded_hex": "574353490100010000280018288485872bf40000102030400000000100000000000f4240524afd8f000101000000000f0264020003e803e8157d5ee388d95b42"
+  },
+  {
+    "name": "csi_8",
+    "message_type": "CSI_FRAME",
+    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 2, "device_time_us": 2000000},
+    "payload": {"source_mac": "5ee388d95b42", "destination_mac": "288485872bf4", "rssi": -80, "noise_floor": -95, "channel": 4, "secondary_channel": 0, "rx_timestamp": 287454020, "signal_length": 128, "rate": 11, "signal_mode": 1, "mcs": 3, "bandwidth": 0, "phy_flags": 33, "antenna": 0, "rx_state": 0, "first_word_invalid": false, "iq_hex": "0001020304050607"},
+    "encoded_hex": "57435349010002000028002c288485872bf40000102030400000000200000000001e8480661b8ff85ee388d95b42288485872bf4b0a1040011223344008000080b01030000210000000000000001020304050607"
+  },
+  {
+    "name": "sensing_active",
+    "message_type": "SENSING_STATE",
+    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 3, "device_time_us": 3000000},
+    "payload": {"peer_mac": "5ee388d95b42", "stable_state": 1, "process_state": 2, "init_stage": 2, "flags": 7, "reason": 1, "jitter": 0.5, "wander": 0.25, "smooth_scaled": 10, "enter_level_scaled": 20, "exit_level_scaled": 5, "presence_wander_average": 0.125, "presence_someone_threshold": 0.25, "config": [0.5, 0.25, 0.125, 300]},
+    "encoded_hex": "574353490100030000280038288485872bf40000102030400000000300000000002dc6c0116bb09b5ee388d95b420102020701003f0000003e8000000000000a00000014000000053e0000003e8000003f0000003e8000003e0000000000012c"
+  },
+  {
+    "name": "heartbeat",
+    "message_type": "HEARTBEAT",
+    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 4, "device_time_us": 4000000},
+    "payload": {"uptime_us": 1000000, "free_heap": 300000, "minimum_free_heap": 250000, "csi_accepted": 50, "csi_sent": 49, "queue_dropped": 1, "udp_send_errors": 0},
+    "encoded_hex": "574353490100040000280020288485872bf40000102030400000000400000000003d09005334d14f00000000000f4240000493e00003d09000000032000000310000000100000000"
+  },
+  {
+    "name": "get_config",
+    "message_type": "COMMAND",
+    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 5, "device_time_us": 5000000},
+    "payload": {"correlation_id": 7, "opcode": 1},
+    "encoded_hex": "574353490100050000280008288485872bf40000102030400000000500000000004c4b40c785c5350000000701000000"
+  },
+  {
+    "name": "set_config",
+    "message_type": "COMMAND",
+    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 6, "device_time_us": 6000000},
+    "payload": {"correlation_id": 8, "opcode": 3, "config": [0.5, 0.25, 0.125, 300]},
+    "encoded_hex": "574353490100050000280018288485872bf40000102030400000000600000000005b8d805825e45400000008030000003f0000003e8000003e0000000000012c"
+  },
+  {
+    "name": "get_config_ack",
+    "message_type": "COMMAND_ACK",
+    "header": {"node_id": "288485872bf4", "boot_id": 270544960, "sequence": 7, "device_time_us": 7000000},
+    "payload": {"correlation_id": 7, "opcode": 1, "status": 0, "config": [0.5, 0.25, 0.125, 300]},
+    "encoded_hex": "574353490100060000280018288485872bf40000102030400000000700000000006acfc070e36d7200000007010000003f0000003e8000003e0000000000012c"
+  }
+]
