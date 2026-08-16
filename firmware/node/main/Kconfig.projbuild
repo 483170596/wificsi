@@ -56,4 +56,14 @@ menu "WCSI node configuration"
         range 1000 60000
         default 5000
 
+    config WCSI_SENSING_INIT_FAULT_SELF_TEST
+        bool "Fail the first sensing installation for recovery self-test"
+        depends on WIFICSI_PROTOCOL_SELF_TEST
+        default n
+
+    config WCSI_TX_ORDER_FAULT_SELF_TEST
+        bool "Delay one command ACK after sequence allocation"
+        depends on WIFICSI_PROTOCOL_SELF_TEST
+        default n
+
 endmenu

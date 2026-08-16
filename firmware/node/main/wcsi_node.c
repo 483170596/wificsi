@@ -14,6 +14,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -85,6 +86,8 @@ static const uint32_t RECONNECT_DELAYS_MS[] = {1000, 2000, 4000, 8000, 15000};
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t s_csi_queue;
 static QueueHandle_t s_control_queue;
+static SemaphoreHandle_t s_tx_mutex;
+static SemaphoreHandle_t s_sensing_mutex;
 static StaticQueue_t s_csi_queue_state;
 static uint8_t *s_csi_queue_storage;
 static int s_socket = -1;
@@ -101,10 +104,20 @@ static uint32_t s_queue_dropped;
 static uint32_t s_udp_send_errors;
 static uint32_t s_reconnect_attempt;
 static bool s_connected;
+static bool s_sensing_ready;
 static bool s_hello_requested;
 static TaskHandle_t s_reconnect_task;
+static TaskHandle_t s_sensing_retry_task;
 static wcsi_ack_cache_entry_t s_ack_cache[WCSI_ACK_CACHE_CAPACITY];
 static size_t s_ack_cache_next;
+
+#if CONFIG_WCSI_SENSING_INIT_FAULT_SELF_TEST
+static bool s_sensing_failure_injected;
+#endif
+
+#if CONFIG_WCSI_TX_ORDER_FAULT_SELF_TEST
+static bool s_tx_delay_injected;
+#endif
 
 static uint32_t locked_increment(uint32_t *counter)
 {
@@ -133,6 +146,25 @@ static bool node_is_connected(void)
     return connected;
 }
 
+static void snapshot_ap_identity(uint8_t bssid[6], uint8_t *channel)
+{
+    portENTER_CRITICAL(&s_lock);
+    memcpy(bssid, s_ap_bssid, sizeof(s_ap_bssid));
+    if (channel != NULL) {
+        *channel = s_ap_channel;
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
+static bool ap_identity_matches(const uint8_t bssid[6])
+{
+    bool matches;
+    portENTER_CRITICAL(&s_lock);
+    matches = s_connected && memcmp(bssid, s_ap_bssid, sizeof(s_ap_bssid)) == 0;
+    portEXIT_CRITICAL(&s_lock);
+    return matches;
+}
+
 static bool enqueue_csi(QueueHandle_t queue, const wcsi_csi_queue_item_t *item,
                         uint32_t *accepted, uint32_t *dropped)
 {
@@ -158,8 +190,8 @@ static wcsi_header_t next_header(wcsi_message_type_t message_type)
     return header;
 }
 
-static bool send_datagram_to(const uint8_t *datagram, size_t length,
-                             const struct sockaddr_in *destination)
+static bool send_datagram_unlocked(const uint8_t *datagram, size_t length,
+                                   const struct sockaddr_in *destination)
 {
     int sent = sendto(s_socket, datagram, length, 0,
                       (const struct sockaddr *)destination, sizeof(*destination));
@@ -170,11 +202,19 @@ static bool send_datagram_to(const uint8_t *datagram, size_t length,
     return true;
 }
 
+static bool send_cached_datagram_to(const uint8_t *datagram, size_t length,
+                                    const struct sockaddr_in *destination)
+{
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    bool sent = send_datagram_unlocked(datagram, length, destination);
+    xSemaphoreGive(s_tx_mutex);
+    return sent;
+}
+
 static bool send_hello(void)
 {
     uint8_t datagram[WCSI_MAX_DATAGRAM];
     size_t length;
-    wcsi_header_t header = next_header(WCSI_MESSAGE_HELLO);
     wcsi_hello_t hello = {
         .chip_model = 1,
         .firmware_major = WCSI_FIRMWARE_MAJOR,
@@ -187,9 +227,14 @@ static bool send_hello(void)
         .state_interval_ms = CONFIG_WCSI_STATE_PERIOD_MS,
         .listen_port = CONFIG_WCSI_LOCAL_PORT,
     };
-    memcpy(hello.ap_bssid, s_ap_bssid, sizeof(hello.ap_bssid));
-    return wcsi_encode_hello(&header, &hello, datagram, sizeof(datagram), &length) == ESP_OK &&
-           send_datagram_to(datagram, length, &s_server_address);
+    snapshot_ap_identity(hello.ap_bssid, NULL);
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    wcsi_header_t header = next_header(WCSI_MESSAGE_HELLO);
+    bool sent = wcsi_encode_hello(&header, &hello, datagram, sizeof(datagram), &length) ==
+                    ESP_OK &&
+                send_datagram_unlocked(datagram, length, &s_server_address);
+    xSemaphoreGive(s_tx_mutex);
+    return sent;
 }
 
 static void copy_public_config(wcsi_sensing_config_t *destination,
@@ -209,16 +254,24 @@ static bool send_sensing(uint8_t reason, bool has_override, uint8_t stable_overr
         .stable_state = WCSI_STATE_UNKNOWN,
         .reason = reason,
     };
-    memcpy(sensing.peer_mac, s_ap_bssid, sizeof(sensing.peer_mac));
+    snapshot_ap_identity(sensing.peer_mac, NULL);
 
-    if (s_fsm != NULL) {
+    xSemaphoreTake(s_sensing_mutex, portMAX_DELAY);
+    esp_wifi_sensing_fsm_handle_t fsm;
+    bool sensing_ready;
+    portENTER_CRITICAL(&s_lock);
+    fsm = s_fsm;
+    sensing_ready = s_sensing_ready;
+    portEXIT_CRITICAL(&s_lock);
+    if (fsm != NULL && sensing_ready) {
         esp_wifi_sensing_fsm_state_t state;
         esp_wifi_sensing_fsm_channel_diag_t diag = {0};
         esp_wifi_sensing_fsm_channel_config_t config = {0};
-        esp_err_t state_error = esp_wifi_sensing_fsm_get_state(s_fsm, s_ap_bssid, &state);
-        esp_err_t diag_error = esp_wifi_sensing_fsm_get_channel_diag(s_fsm, s_ap_bssid, &diag);
-        esp_err_t config_error = esp_wifi_sensing_fsm_get_channel_config(s_fsm, s_ap_bssid,
-                                                                         &config);
+        esp_err_t state_error = esp_wifi_sensing_fsm_get_state(fsm, sensing.peer_mac, &state);
+        esp_err_t diag_error = esp_wifi_sensing_fsm_get_channel_diag(fsm, sensing.peer_mac,
+                                                                     &diag);
+        esp_err_t config_error = esp_wifi_sensing_fsm_get_channel_config(
+            fsm, sensing.peer_mac, &config);
         if (diag_error == ESP_OK) {
             sensing.process_state = (uint8_t)diag.state;
             sensing.init_stage = (uint8_t)diag.init_stage;
@@ -248,14 +301,19 @@ static bool send_sensing(uint8_t reason, bool has_override, uint8_t stable_overr
             copy_public_config(&sensing.config, &config);
         }
     }
+    xSemaphoreGive(s_sensing_mutex);
     if (has_override) {
         sensing.stable_state = stable_override;
         sensing.flags |= WCSI_FLAG_EVENT_TRIGGERED;
     }
 
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
     wcsi_header_t header = next_header(WCSI_MESSAGE_SENSING_STATE);
-    return wcsi_encode_sensing(&header, &sensing, datagram, sizeof(datagram), &length) == ESP_OK &&
-           send_datagram_to(datagram, length, &s_server_address);
+    bool sent = wcsi_encode_sensing(&header, &sensing, datagram, sizeof(datagram), &length) ==
+                    ESP_OK &&
+                send_datagram_unlocked(datagram, length, &s_server_address);
+    xSemaphoreGive(s_tx_mutex);
+    return sent;
 }
 
 static bool send_heartbeat(void)
@@ -271,10 +329,13 @@ static bool send_heartbeat(void)
         .queue_dropped = locked_read(&s_queue_dropped),
         .udp_send_errors = locked_read(&s_udp_send_errors),
     };
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
     wcsi_header_t header = next_header(WCSI_MESSAGE_HEARTBEAT);
-    return wcsi_encode_heartbeat(&header, &heartbeat, datagram, sizeof(datagram), &length) ==
-               ESP_OK &&
-           send_datagram_to(datagram, length, &s_server_address);
+    bool sent = wcsi_encode_heartbeat(&header, &heartbeat, datagram, sizeof(datagram), &length) ==
+                    ESP_OK &&
+                send_datagram_unlocked(datagram, length, &s_server_address);
+    xSemaphoreGive(s_tx_mutex);
+    return sent;
 }
 
 static void send_csi(const wcsi_csi_queue_item_t *item)
@@ -302,9 +363,12 @@ static void send_csi(const wcsi_csi_queue_item_t *item)
     };
     memcpy(csi.source_mac, metadata->source_mac, sizeof(csi.source_mac));
     memcpy(csi.destination_mac, metadata->destination_mac, sizeof(csi.destination_mac));
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
     wcsi_header_t header = next_header(WCSI_MESSAGE_CSI_FRAME);
-    if (wcsi_encode_csi(&header, &csi, datagram, sizeof(datagram), &length) == ESP_OK &&
-        send_datagram_to(datagram, length, &s_server_address)) {
+    bool sent = wcsi_encode_csi(&header, &csi, datagram, sizeof(datagram), &length) == ESP_OK &&
+                send_datagram_unlocked(datagram, length, &s_server_address);
+    xSemaphoreGive(s_tx_mutex);
+    if (sent) {
         locked_increment(&s_csi_sent);
     }
 }
@@ -388,12 +452,27 @@ static esp_err_t apply_command(const wcsi_command_t *command,
                                wcsi_sensing_config_t *response_config,
                                const wcsi_sensing_config_t **response_config_pointer)
 {
-    if (s_fsm == NULL || !node_is_connected()) {
+    if (!node_is_connected()) {
         return ESP_ERR_INVALID_STATE;
     }
+    uint8_t ap_bssid[6];
+    snapshot_ap_identity(ap_bssid, NULL);
+    xSemaphoreTake(s_sensing_mutex, portMAX_DELAY);
+    esp_wifi_sensing_fsm_handle_t fsm;
+    bool sensing_ready;
+    portENTER_CRITICAL(&s_lock);
+    fsm = s_fsm;
+    sensing_ready = s_sensing_ready;
+    portEXIT_CRITICAL(&s_lock);
+    if (fsm == NULL || !sensing_ready) {
+        xSemaphoreGive(s_sensing_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t error;
     if (command->opcode == WCSI_COMMAND_RESET_BASELINE) {
-        esp_err_t error = esp_wifi_sensing_fsm_control(
-            s_fsm, ESP_WIFI_SENSING_FSM_CTRL_RESET_BASELINE, NULL);
+        error = esp_wifi_sensing_fsm_control(
+            fsm, ESP_WIFI_SENSING_FSM_CTRL_RESET_BASELINE, NULL);
+        xSemaphoreGive(s_sensing_mutex);
         if (error == ESP_OK) {
             wcsi_control_item_t item = {.reason = WCSI_STATE_REASON_RESET};
             xQueueSend(s_control_queue, &item, 0);
@@ -402,12 +481,12 @@ static esp_err_t apply_command(const wcsi_command_t *command,
     }
     if (command->opcode == WCSI_COMMAND_GET_CONFIG) {
         esp_wifi_sensing_fsm_channel_config_t config;
-        esp_err_t error = esp_wifi_sensing_fsm_get_channel_config(s_fsm, s_ap_bssid,
-                                                                  &config);
+        error = esp_wifi_sensing_fsm_get_channel_config(fsm, ap_bssid, &config);
         if (error == ESP_OK) {
             copy_public_config(response_config, &config);
             *response_config_pointer = response_config;
         }
+        xSemaphoreGive(s_sensing_mutex);
         return error;
     }
     if (command->opcode == WCSI_COMMAND_SET_CONFIG) {
@@ -420,6 +499,7 @@ static esp_err_t apply_command(const wcsi_command_t *command,
             command->config.presence_sensitivity > 1.0f ||
             command->config.active_jitter_min < 0.0f ||
             command->config.active_filter_ms > 60000U) {
+            xSemaphoreGive(s_sensing_mutex);
             return ESP_ERR_INVALID_ARG;
         }
         esp_wifi_sensing_fsm_channel_config_t config = {
@@ -428,14 +508,15 @@ static esp_err_t apply_command(const wcsi_command_t *command,
             .active_jitter_min = command->config.active_jitter_min,
             .active_filter_ms = command->config.active_filter_ms,
         };
-        esp_err_t error = esp_wifi_sensing_fsm_set_channel_config(s_fsm, s_ap_bssid,
-                                                                  &config);
+        error = esp_wifi_sensing_fsm_set_channel_config(fsm, ap_bssid, &config);
         if (error == ESP_OK) {
             copy_public_config(response_config, &config);
             *response_config_pointer = response_config;
         }
+        xSemaphoreGive(s_sensing_mutex);
         return error;
     }
+    xSemaphoreGive(s_sensing_mutex);
     return ESP_ERR_NOT_SUPPORTED;
 }
 
@@ -452,7 +533,7 @@ static void handle_command(const uint8_t *datagram, size_t length,
     wcsi_ack_cache_entry_t *cached = find_cached_ack(command_header.boot_id,
                                                      command.correlation_id);
     if (cached != NULL) {
-        send_datagram_to(cached->datagram, cached->length, source);
+        send_cached_datagram_to(cached->datagram, cached->length, source);
         return;
     }
 
@@ -470,11 +551,20 @@ static void handle_command(const uint8_t *datagram, size_t length,
         .status = status,
         .config = response_config_pointer,
     };
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
     wcsi_header_t ack_header = next_header(WCSI_MESSAGE_COMMAND_ACK);
+#if CONFIG_WCSI_TX_ORDER_FAULT_SELF_TEST
+    if (!s_tx_delay_injected) {
+        s_tx_delay_injected = true;
+        ESP_LOGW(TAG, "TX order fault self-test delaying allocated ACK");
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+#endif
     wcsi_ack_cache_entry_t *entry = &s_ack_cache[s_ack_cache_next];
     size_t encoded_length;
     if (wcsi_encode_ack(&ack_header, &ack, entry->datagram, sizeof(entry->datagram),
                         &encoded_length) != ESP_OK) {
+        xSemaphoreGive(s_tx_mutex);
         return;
     }
     entry->valid = true;
@@ -482,7 +572,8 @@ static void handle_command(const uint8_t *datagram, size_t length,
     entry->correlation_id = command.correlation_id;
     entry->length = encoded_length;
     s_ack_cache_next = (s_ack_cache_next + 1U) % WCSI_ACK_CACHE_CAPACITY;
-    send_datagram_to(entry->datagram, entry->length, source);
+    send_datagram_unlocked(entry->datagram, entry->length, source);
+    xSemaphoreGive(s_tx_mutex);
 }
 
 static void command_task(void *argument)
@@ -505,69 +596,171 @@ static void command_task(void *argument)
 
 static esp_err_t install_sensing_for_ap(const uint8_t ap_bssid[6])
 {
-    if (s_fsm == NULL) {
-        esp_wifi_sensing_fsm_config_t fsm_config = DEFAULT_ESP_WIFI_SENSING_FSM_CONFIG();
-        fsm_config.max_channel_num = 1;
-        esp_err_t error = esp_wifi_sensing_fsm_create(&fsm_config, &s_fsm);
-        if (error != ESP_OK) {
-            return error;
-        }
-
-        esp_radar_config_t radar_config;
-        error = esp_radar_get_config(&radar_config);
-        if (error != ESP_OK) {
-            return error;
-        }
-        radar_config.csi_config.csi_filtered_cb = wcsi_node_on_filtered_csi;
-        radar_config.csi_config.csi_filtered_cb_ctx = NULL;
-        error = esp_radar_change_config(&radar_config);
-        if (error != ESP_OK) {
-            return error;
-        }
-
-        error = esp_wifi_sensing_fsm_add_channel(s_fsm, ap_bssid);
-        if (error != ESP_OK) {
-            return error;
-        }
-        error = esp_wifi_sensing_fsm_register_event_cb(
-            s_fsm, ESP_WIFI_SENSING_FSM_EVENT_ACTIVE, wcsi_node_on_sensing_event, NULL);
-        if (error != ESP_OK) {
-            return error;
-        }
-        error = esp_wifi_sensing_fsm_register_event_cb(
-            s_fsm, ESP_WIFI_SENSING_FSM_EVENT_INACTIVE, wcsi_node_on_sensing_event, NULL);
-        if (error != ESP_OK) {
-            return error;
-        }
-        error = esp_wifi_sensing_fsm_control(s_fsm, ESP_WIFI_SENSING_FSM_CTRL_START, NULL);
-        if (error != ESP_OK) {
-            return error;
-        }
-        ESP_LOGI(TAG, "official sensing FSM started for AP channel");
-    } else if (memcmp(s_ap_bssid, ap_bssid, sizeof(s_ap_bssid)) != 0) {
-        esp_err_t error = esp_wifi_sensing_fsm_remove_channel(s_fsm, s_ap_bssid);
-        if (error != ESP_OK && error != ESP_ERR_NOT_FOUND) {
-            return error;
-        }
-        error = esp_wifi_sensing_fsm_add_channel(s_fsm, ap_bssid);
-        if (error != ESP_OK) {
-            return error;
+    xSemaphoreTake(s_sensing_mutex, portMAX_DELAY);
+    esp_wifi_sensing_fsm_handle_t old_fsm;
+    portENTER_CRITICAL(&s_lock);
+    old_fsm = s_fsm;
+    s_fsm = NULL;
+    s_sensing_ready = false;
+    portEXIT_CRITICAL(&s_lock);
+    if (old_fsm != NULL) {
+        esp_err_t delete_error = esp_wifi_sensing_fsm_delete(old_fsm);
+        if (delete_error != ESP_OK) {
+            portENTER_CRITICAL(&s_lock);
+            s_fsm = old_fsm;
+            portEXIT_CRITICAL(&s_lock);
+            ESP_LOGE(TAG, "old sensing FSM cleanup failed: %s",
+                     esp_err_to_name(delete_error));
+            xSemaphoreGive(s_sensing_mutex);
+            return delete_error;
         }
     }
 
-    esp_err_t error = esp_wifi_sensing_fsm_control(
-        s_fsm, ESP_WIFI_SENSING_FSM_CTRL_RESET_BASELINE, NULL);
+    esp_wifi_sensing_fsm_handle_t new_fsm = NULL;
+    esp_wifi_sensing_fsm_config_t fsm_config = DEFAULT_ESP_WIFI_SENSING_FSM_CONFIG();
+    fsm_config.max_channel_num = 1;
+    esp_err_t error = esp_wifi_sensing_fsm_create(&fsm_config, &new_fsm);
     if (error != ESP_OK) {
-        return error;
+        goto cleanup;
     }
-    esp_wifi_sensing_fsm_ping_router_stop(s_fsm);
-    error = esp_wifi_sensing_fsm_ping_router_start(s_fsm);
-    if (error == ESP_OK) {
+
+    esp_radar_config_t radar_config;
+    error = esp_radar_get_config(&radar_config);
+    if (error != ESP_OK) {
+        goto cleanup;
+    }
+    radar_config.csi_config.csi_filtered_cb = wcsi_node_on_filtered_csi;
+    radar_config.csi_config.csi_filtered_cb_ctx = NULL;
+    error = esp_radar_change_config(&radar_config);
+    if (error != ESP_OK) {
+        goto cleanup;
+    }
+
+#if CONFIG_WCSI_SENSING_INIT_FAULT_SELF_TEST
+    if (!s_sensing_failure_injected) {
+        s_sensing_failure_injected = true;
+        ESP_LOGW(TAG, "sensing fault self-test injecting post-create failure");
+        error = ESP_FAIL;
+        goto cleanup;
+    }
+#endif
+
+    error = esp_wifi_sensing_fsm_add_channel(new_fsm, ap_bssid);
+    if (error != ESP_OK) {
+        goto cleanup;
+    }
+    error = esp_wifi_sensing_fsm_register_event_cb(
+        new_fsm, ESP_WIFI_SENSING_FSM_EVENT_ACTIVE, wcsi_node_on_sensing_event, NULL);
+    if (error != ESP_OK) {
+        goto cleanup;
+    }
+    error = esp_wifi_sensing_fsm_register_event_cb(
+        new_fsm, ESP_WIFI_SENSING_FSM_EVENT_INACTIVE, wcsi_node_on_sensing_event, NULL);
+    if (error != ESP_OK) {
+        goto cleanup;
+    }
+    error = esp_wifi_sensing_fsm_control(new_fsm, ESP_WIFI_SENSING_FSM_CTRL_START, NULL);
+    if (error != ESP_OK) {
+        goto cleanup;
+    }
+    error = esp_wifi_sensing_fsm_control(
+        new_fsm, ESP_WIFI_SENSING_FSM_CTRL_RESET_BASELINE, NULL);
+    if (error != ESP_OK) {
+        goto cleanup;
+    }
+    esp_err_t ping_error = esp_wifi_sensing_fsm_ping_router_start(new_fsm);
+    if (ping_error == ESP_OK) {
         ESP_LOGI(TAG, "router ping started");
     } else {
-        ESP_LOGW(TAG, "router ping start failed: %s", esp_err_to_name(error));
+        ESP_LOGW(TAG, "router ping start failed: %s", esp_err_to_name(ping_error));
     }
-    return ESP_OK;
+    if (!ap_identity_matches(ap_bssid)) {
+        error = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_fsm = new_fsm;
+    s_sensing_ready = true;
+    portEXIT_CRITICAL(&s_lock);
+    new_fsm = NULL;
+    ESP_LOGI(TAG, "official sensing FSM started for AP channel");
+
+cleanup:
+    if (new_fsm != NULL) {
+        esp_err_t delete_error = esp_wifi_sensing_fsm_delete(new_fsm);
+        if (delete_error != ESP_OK) {
+            portENTER_CRITICAL(&s_lock);
+            s_fsm = new_fsm;
+            portEXIT_CRITICAL(&s_lock);
+            new_fsm = NULL;
+            ESP_LOGE(TAG, "partial sensing FSM rollback deferred: %s",
+                     esp_err_to_name(delete_error));
+        }
+    }
+    xSemaphoreGive(s_sensing_mutex);
+    return error;
+}
+
+static void sensing_retry_task(void *argument)
+{
+    (void)argument;
+    size_t retry_index = 0;
+    while (node_is_connected()) {
+        size_t delay_index = retry_index;
+        if (delay_index >= sizeof(RECONNECT_DELAYS_MS) / sizeof(RECONNECT_DELAYS_MS[0])) {
+            delay_index = sizeof(RECONNECT_DELAYS_MS) / sizeof(RECONNECT_DELAYS_MS[0]) - 1U;
+        }
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAYS_MS[delay_index]));
+        if (!node_is_connected()) {
+            break;
+        }
+        wifi_ap_record_t ap_info = {0};
+        esp_err_t error = esp_wifi_sta_get_ap_info(&ap_info);
+        if (error == ESP_OK) {
+            error = install_sensing_for_ap(ap_info.bssid);
+        }
+        if (error != ESP_OK) {
+            ESP_LOGW(TAG, "sensing retry %lu failed: %s", (unsigned long)(retry_index + 1U),
+                     esp_err_to_name(error));
+            ++retry_index;
+            continue;
+        }
+        ESP_LOGI(TAG, "sensing initialization recovered on retry %lu",
+                 (unsigned long)(retry_index + 1U));
+#if CONFIG_WCSI_SENSING_INIT_FAULT_SELF_TEST
+        ESP_LOGI(TAG, "sensing fault self-test retry PASS");
+#endif
+        break;
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_sensing_retry_task = NULL;
+    portEXIT_CRITICAL(&s_lock);
+    vTaskDelete(NULL);
+}
+
+static void schedule_sensing_retry(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    bool start_task = s_sensing_retry_task == NULL;
+    if (start_task) {
+        s_sensing_retry_task = (TaskHandle_t)1;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (!start_task) {
+        return;
+    }
+    TaskHandle_t task = NULL;
+    if (xTaskCreate(sensing_retry_task, "wcsi_sensing_retry", 4096,
+                    NULL, 5, &task) != pdPASS) {
+        portENTER_CRITICAL(&s_lock);
+        s_sensing_retry_task = NULL;
+        portEXIT_CRITICAL(&s_lock);
+        ESP_LOGE(TAG, "cannot create sensing retry task");
+        return;
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_sensing_retry_task = task;
+    portEXIT_CRITICAL(&s_lock);
 }
 
 static void reconnect_task(void *argument)
@@ -601,9 +794,11 @@ static void reconnect_self_test_task(void *argument)
 void wcsi_node_on_filtered_csi(void *ctx, const wifi_csi_filtered_info_t *filtered)
 {
     (void)ctx;
+    uint8_t ap_bssid[6];
+    snapshot_ap_identity(ap_bssid, NULL);
     if (filtered == NULL || filtered->info == NULL || filtered->raw_data == NULL ||
         filtered->raw_len == 0 || filtered->raw_len > WCSI_MAX_CSI_LENGTH ||
-        memcmp(filtered->info->mac, s_ap_bssid, sizeof(s_ap_bssid)) != 0 ||
+        memcmp(filtered->info->mac, ap_bssid, sizeof(ap_bssid)) != 0 ||
         s_csi_queue == NULL) {
         return;
     }
@@ -643,7 +838,9 @@ void wcsi_node_on_sensing_event(esp_wifi_sensing_fsm_handle_t handle,
     (void)handle;
     (void)data;
     (void)user_data;
-    if (peer_mac == NULL || memcmp(peer_mac, s_ap_bssid, sizeof(s_ap_bssid)) != 0 ||
+    uint8_t ap_bssid[6];
+    snapshot_ap_identity(ap_bssid, NULL);
+    if (peer_mac == NULL || memcmp(peer_mac, ap_bssid, sizeof(ap_bssid)) != 0 ||
         s_control_queue == NULL) {
         return;
     }
@@ -661,6 +858,7 @@ void wcsi_node_on_disconnected(void)
     uint32_t delay_ms;
     portENTER_CRITICAL(&s_lock);
     s_connected = false;
+    s_sensing_ready = false;
     size_t delay_index = s_reconnect_attempt;
     if (delay_index >= sizeof(RECONNECT_DELAYS_MS) / sizeof(RECONNECT_DELAYS_MS[0])) {
         delay_index = sizeof(RECONNECT_DELAYS_MS) / sizeof(RECONNECT_DELAYS_MS[0]) - 1U;
@@ -672,9 +870,23 @@ void wcsi_node_on_disconnected(void)
     if (s_csi_queue != NULL) {
         xQueueReset(s_csi_queue);
     }
-    if (s_fsm != NULL) {
-        esp_wifi_sensing_fsm_ping_router_stop(s_fsm);
+    xSemaphoreTake(s_sensing_mutex, portMAX_DELAY);
+    esp_wifi_sensing_fsm_handle_t fsm;
+    portENTER_CRITICAL(&s_lock);
+    fsm = s_fsm;
+    s_fsm = NULL;
+    portEXIT_CRITICAL(&s_lock);
+    if (fsm != NULL) {
+        esp_err_t delete_error = esp_wifi_sensing_fsm_delete(fsm);
+        if (delete_error != ESP_OK) {
+            portENTER_CRITICAL(&s_lock);
+            s_fsm = fsm;
+            portEXIT_CRITICAL(&s_lock);
+            ESP_LOGE(TAG, "disconnected sensing FSM cleanup failed: %s",
+                     esp_err_to_name(delete_error));
+        }
     }
+    xSemaphoreGive(s_sensing_mutex);
     if (start_task) {
         if (xTaskCreate(reconnect_task, "wcsi_reconnect", 3072,
                         (void *)(uintptr_t)delay_ms, 5, &s_reconnect_task) != pdPASS) {
@@ -696,21 +908,23 @@ void wcsi_node_on_connected(void)
         ESP_LOGE(TAG, "cannot read connected AP: %s", esp_err_to_name(error));
         return;
     }
-    error = install_sensing_for_ap(ap_info.bssid);
-    if (error != ESP_OK) {
-        ESP_LOGE(TAG, "sensing initialization failed: %s", esp_err_to_name(error));
-        return;
-    }
+    portENTER_CRITICAL(&s_lock);
     memcpy(s_ap_bssid, ap_info.bssid, sizeof(s_ap_bssid));
     s_ap_channel = ap_info.primary;
-    portENTER_CRITICAL(&s_lock);
     s_connected = true;
+    s_sensing_ready = false;
     s_reconnect_attempt = 0;
     s_hello_requested = true;
     portEXIT_CRITICAL(&s_lock);
     wcsi_control_item_t item = {.reason = WCSI_STATE_REASON_RECONNECT};
     xQueueSend(s_control_queue, &item, 0);
-    ESP_LOGI(TAG, "IPv4 ready; AP channel=%u", s_ap_channel);
+    ESP_LOGI(TAG, "IPv4 ready; AP channel=%u", ap_info.primary);
+
+    error = install_sensing_for_ap(ap_info.bssid);
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "sensing initialization failed: %s", esp_err_to_name(error));
+        schedule_sensing_retry();
+    }
 
 #if CONFIG_WCSI_RECONNECT_SELF_TEST
     static bool reconnect_test_started;
@@ -767,7 +981,10 @@ esp_err_t wcsi_node_init(void)
                                      s_csi_queue_storage, &s_csi_queue_state);
     s_control_queue = xQueueCreate(WCSI_CONTROL_QUEUE_CAPACITY,
                                    sizeof(wcsi_control_item_t));
-    if (s_csi_queue == NULL || s_control_queue == NULL) {
+    s_tx_mutex = xSemaphoreCreateMutex();
+    s_sensing_mutex = xSemaphoreCreateMutex();
+    if (s_csi_queue == NULL || s_control_queue == NULL || s_tx_mutex == NULL ||
+        s_sensing_mutex == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
