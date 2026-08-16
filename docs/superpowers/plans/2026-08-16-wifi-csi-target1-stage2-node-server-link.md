@@ -440,8 +440,9 @@ in `sdkconfig.defaults`.
 Do not cast packed structs onto byte buffers. Add explicit big-endian helpers
 for u16/u32/u64 and float bit patterns. Write the header with CRC zero, append
 the payload, compute
-`esp_crc32_le(UINT32_MAX, bytes, length) ^ UINT32_MAX`, then write the
-network-order CRC value.
+`esp_crc32_le(0, bytes, length)`, then write the network-order CRC value. In
+ESP-IDF 5.4.4 this API performs the initial and final complement internally;
+the zero seed therefore matches Python `zlib.crc32` and the committed vectors.
 Reject null pointers, zero/oversize CSI, output-capacity shortage, unknown
 command opcode, bad length, bad CRC, and nonzero reserved fields.
 

@@ -1,0 +1,41 @@
+menu "WCSI node configuration"
+
+    config WCSI_SERVER_ADDRESS
+        string "Sensing server IPv4 address"
+        default "10.204.75.168"
+
+    config WCSI_SERVER_PORT
+        int "Sensing server UDP port"
+        range 1 65535
+        default 5500
+
+    config WCSI_LOCAL_PORT
+        int "Node command UDP port"
+        range 1 65535
+        default 5501
+
+    config WCSI_QUEUE_CAPACITY
+        int "Telemetry queue capacity"
+        range 8 2048
+        default 512
+
+    config WCSI_HEARTBEAT_PERIOD_MS
+        int "Heartbeat period (ms)"
+        range 100 60000
+        default 1000
+
+    config WCSI_STATE_PERIOD_MS
+        int "Sensing state period (ms)"
+        range 100 60000
+        default 1000
+
+    config WCSI_HELLO_PERIOD_MS
+        int "HELLO period (ms)"
+        range 1000 300000
+        default 30000
+
+    config WCSI_RECONNECT_SELF_TEST
+        bool "Enable reconnect fault-injection self-test"
+        default n
+
+endmenu
