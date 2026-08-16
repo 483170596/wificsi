@@ -168,6 +168,11 @@ def test_server_metrics_capture_simulated_link_health_without_raw_csi(tmp_path):
     assert rows[-1]["node_id"] == "28:84:85:87:2b:f4"
     assert rows[-1]["message_counts"]["CSI_FRAME"] >= 30
     assert rows[-1]["parse_errors"] == 0
+    measured = [row for row in rows if row["sample_interval"] is not None]
+    assert measured[-1]["csi_rate"] == measured[-1]["csi_delta"] / measured[-1]["sample_interval"]
+    assert measured[-1]["message_deltas"]["CSI_FRAME"] > 0
+    assert rows[-1]["observed_at"] > 0
+    assert rows[-1]["server_run_started_at"] <= rows[-1]["observed_at"]
     assert "iq" not in rows[-1]
 
 

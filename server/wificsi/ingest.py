@@ -30,6 +30,7 @@ class IngestProtocol(asyncio.DatagramProtocol):
         self.command_manager = command_manager
         self.transport: asyncio.DatagramTransport | None = None
         self.parse_errors: Counter[str] = Counter()
+        self.parse_errors_by_endpoint: dict[tuple[str, int], Counter[str]] = {}
         self.csi_lengths: Counter[int] = Counter()
         self.unexpected_errors = 0
 
@@ -48,6 +49,7 @@ class IngestProtocol(asyncio.DatagramProtocol):
                 self.csi_lengths[len(packet.payload.iq)] += 1
         except ProtocolError as error:
             self.parse_errors[error.code] += 1
+            self.parse_errors_by_endpoint.setdefault(addr, Counter())[error.code] += 1
         except Exception:
             self.unexpected_errors += 1
             LOGGER.exception("unexpected WCSI ingest failure from %s", addr)
