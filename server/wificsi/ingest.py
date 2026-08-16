@@ -6,9 +6,13 @@ import asyncio
 import logging
 from collections import Counter
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-from .protocol import CsiFrame, ProtocolError, decode_packet
+from .protocol import CommandAck, CsiFrame, ProtocolError, decode_packet
 from .registry import NodeRegistry
+
+if TYPE_CHECKING:
+    from .commands import CommandManager
 
 
 LOGGER = logging.getLogger(__name__)
@@ -19,9 +23,11 @@ class IngestProtocol(asyncio.DatagramProtocol):
         self,
         registry: NodeRegistry,
         on_transport: Callable[[asyncio.DatagramTransport], None] | None = None,
+        command_manager: CommandManager | None = None,
     ):
         self.registry = registry
         self.on_transport = on_transport
+        self.command_manager = command_manager
         self.transport: asyncio.DatagramTransport | None = None
         self.parse_errors: Counter[str] = Counter()
         self.csi_lengths: Counter[int] = Counter()
@@ -35,6 +41,8 @@ class IngestProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         try:
             packet = decode_packet(data)
+            if isinstance(packet.payload, CommandAck) and self.command_manager is not None:
+                self.command_manager.handle_ack(packet)
             accepted = self.registry.accept(packet, addr)
             if accepted and isinstance(packet.payload, CsiFrame):
                 self.csi_lengths[len(packet.payload.iq)] += 1

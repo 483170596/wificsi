@@ -5,9 +5,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from .protocol import (
+    AckStatus,
+    Command,
+    CommandAck,
+    CommandOpcode,
     CsiFrame,
     Header,
     Heartbeat,
@@ -18,6 +23,7 @@ from .protocol import (
     SensingConfig,
     SensingState,
     StableState,
+    decode_packet,
     encode_packet,
 )
 
@@ -58,6 +64,9 @@ class SimulatedNode:
         self.sequence = config.start_sequence & 0xFFFFFFFF
         self.csi_accepted = 0
         self.csi_sent = 0
+        self.sensing_config = SensingConfig(0.5, 0.25, 0.125, 300)
+        self.reset_applications = 0
+        self._ack_cache: OrderedDict[tuple[int, int], bytes] = OrderedDict()
 
     def encode(self, payload, device_time_us: int) -> bytes:
         packet = Packet(
@@ -95,7 +104,7 @@ class SimulatedNode:
                 5,
                 0.125,
                 0.25,
-                SensingConfig(0.5, 0.25, 0.125, 300),
+                self.sensing_config,
             ),
             device_time_us,
         )
@@ -147,14 +156,65 @@ class SimulatedNode:
             return bytes(damaged)
         return encoded
 
+    def handle_command(self, data: bytes) -> bytes | None:
+        try:
+            packet = decode_packet(data)
+        except Exception:
+            return None
+        if not isinstance(packet.payload, Command):
+            return None
+        if packet.header.node_id != self.config.node_id or packet.header.boot_id != self.config.boot_id:
+            return None
+        key = (packet.header.boot_id, packet.payload.correlation_id)
+        cached = self._ack_cache.get(key)
+        if cached is not None:
+            return cached
+
+        command = packet.payload
+        status = AckStatus.OK
+        config = None
+        if command.opcode is CommandOpcode.GET_CONFIG:
+            config = self.sensing_config
+        elif command.opcode is CommandOpcode.RESET_BASELINE:
+            self.reset_applications += 1
+        elif command.opcode is CommandOpcode.SET_CONFIG:
+            if command.config is None:
+                status = AckStatus.INVALID_ARGUMENT
+            else:
+                self.sensing_config = command.config
+                config = self.sensing_config
+        ack = self.encode(
+            CommandAck(command.correlation_id, command.opcode, status, config),
+            0,
+        )
+        self._ack_cache[key] = ack
+        self._ack_cache.move_to_end(key)
+        while len(self._ack_cache) > 16:
+            self._ack_cache.popitem(last=False)
+        return ack
+
+
+class _SimulatorProtocol(asyncio.DatagramProtocol):
+    def __init__(self, node: SimulatedNode):
+        self.node = node
+        self.transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, transport) -> None:
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        ack = self.node.handle_command(data)
+        if ack is not None and self.transport is not None:
+            self.transport.sendto(ack)
+
 
 async def run_simulator(config: SimulatorConfig) -> None:
     loop = asyncio.get_running_loop()
+    node = SimulatedNode(config)
     transport, _ = await loop.create_datagram_endpoint(
-        asyncio.DatagramProtocol,
+        lambda: _SimulatorProtocol(node),
         remote_addr=(config.host, config.port),
     )
-    node = SimulatedNode(config)
     start = loop.time()
     next_hello = start
     next_state = start
