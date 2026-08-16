@@ -1,5 +1,17 @@
 menu "WCSI node configuration"
 
+    config WIFICSI_PROTOCOL_SELF_TEST
+        bool "Run WCSI protocol and queue startup self-tests"
+        default y
+
+    config WCSI_WIFI_SSID
+        string "Wi-Fi SSID (set only in the ignored generated sdkconfig)"
+        default ""
+
+    config WCSI_WIFI_PASSWORD
+        string "Wi-Fi password (set only in the ignored generated sdkconfig)"
+        default ""
+
     config WCSI_SERVER_ADDRESS
         string "Sensing server IPv4 address"
         default "10.204.75.168"
@@ -37,5 +49,11 @@ menu "WCSI node configuration"
     config WCSI_RECONNECT_SELF_TEST
         bool "Enable reconnect fault-injection self-test"
         default n
+
+    config WCSI_RECONNECT_SELF_TEST_DELAY_MS
+        int "Reconnect fault-injection delay after first IP (ms)"
+        depends on WCSI_RECONNECT_SELF_TEST
+        range 1000 60000
+        default 5000
 
 endmenu
