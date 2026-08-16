@@ -112,6 +112,18 @@ def test_duration_is_sum_of_legitimate_intervals_not_wall_clock_span():
     assert "duration_below_600_seconds" in result.failures
 
 
+def test_duration_excludes_silent_target_intervals_even_when_the_wall_span_is_600_seconds():
+    metrics, observations = _passing_inputs()
+    measured = [row for row in metrics if row.get("sample_interval")]
+    for row in measured[3:]:
+        row["message_deltas"] = {}
+
+    result = validate(metrics, observations)
+
+    assert result.metrics["duration_seconds"] == 75
+    assert "duration_below_600_seconds" in result.failures
+
+
 def test_reconnect_requires_deltas_strictly_after_the_observed_resume_time():
     metrics, observations = _passing_inputs()
     for row in metrics:
@@ -129,6 +141,16 @@ def test_reversed_reconnect_timestamps_report_the_order_failure_first():
     observations["reconnect_reconnected_at"] = 1300
 
     assert "invalid_reconnect_observation_order" in validate(metrics, observations).failures
+
+
+def test_reconnect_window_must_not_overlap_or_nest_inside_server_restart():
+    metrics, observations = _passing_inputs()
+    observations.update(reconnect_disconnected_at=1105, reconnect_reconnected_at=1120)
+    assert "reconnect_overlaps_server_restart" in validate(metrics, observations).failures
+
+    metrics, observations = _passing_inputs()
+    observations.update(reconnect_disconnected_at=1050, reconnect_reconnected_at=1150)
+    assert "reconnect_overlaps_server_restart" in validate(metrics, observations).failures
 
 
 def test_each_missing_stage2_condition_has_a_stable_reason():
@@ -232,15 +254,14 @@ def test_accelerated_simulator_fault_matrix_recovers_then_validates_real_timesta
         port = reservation.getsockname()[1]
         reservation.close()
         node = bytes.fromhex("021122334455")
-        simulator_started_at = time.time()
         target_simulator = asyncio.create_task(run_simulator(SimulatorConfig(
             host="127.0.0.1", port=port, node_id=node, boot_id=0x10203040,
-            rate=200, duration=2.2, hello_interval=0.01, state_interval=0.01,
-            heartbeat_interval=0.01, telemetry_pause_at=0.45, telemetry_pause_duration=0.25,
+            rate=200, duration=2.5, hello_interval=0.01, state_interval=0.01,
+            heartbeat_interval=0.01, telemetry_pause_at=0.25, telemetry_pause_duration=0.15,
         )))
-        fault_metrics = tmp_path / "fault.jsonl"
-        fault_server = asyncio.create_task(
-            run_server("127.0.0.1", port, duration=0.14, metrics_jsonl=fault_metrics, metrics_interval=0.02)
+        metrics_path = tmp_path / "recovery.jsonl"
+        first = asyncio.create_task(
+            run_server("127.0.0.1", port, duration=0.8, metrics_jsonl=metrics_path, metrics_interval=0.02)
         )
         await asyncio.sleep(0.01)
         await run_simulator(SimulatorConfig(
@@ -248,46 +269,39 @@ def test_accelerated_simulator_fault_matrix_recovers_then_validates_real_timesta
             rate=200, duration=0.1, hello_interval=0.02, state_interval=0.02,
             heartbeat_interval=0.02, corrupt_every=2,
         ))
-        await fault_server
-
-        metrics_path = tmp_path / "recovery.jsonl"
-        first = asyncio.create_task(
-            run_server("127.0.0.1", port, duration=0.37, metrics_jsonl=metrics_path, metrics_interval=0.02)
-        )
-        await asyncio.sleep(0.01)
         await first
         stopped = time.time()
         await asyncio.sleep(0.03)
         started = time.time()
         second = asyncio.create_task(
             run_server(
-                "127.0.0.1", port, duration=1.7,
+                "127.0.0.1", port, duration=1.3,
                 command_requests=((node, CommandOpcode.GET_CONFIG), (node, CommandOpcode.RESET_BASELINE)),
                 metrics_jsonl=metrics_path, metrics_interval=0.02,
             )
         )
         await asyncio.sleep(0.01)
         await second
-        await target_simulator
+        target_run = await target_simulator
         rows = [json.loads(line) for line in metrics_path.read_text().splitlines()]
         target = "02:11:22:33:44:55"
         restarted = [row for row in rows if row["node_id"] == target and row["observed_at"] >= started]
         return (
-            [json.loads(line) for line in fault_metrics.read_text().splitlines()],
             rows,
             {
                 "target_node_id": target,
                 "server_stopped_at": stopped,
                 "server_started_at": started,
                 "server_rediscovered_at": restarted[0]["observed_at"],
-                "reconnect_disconnected_at": simulator_started_at + 0.45,
-                "reconnect_reconnected_at": simulator_started_at + 0.70,
+                "reconnect_disconnected_at": target_run.pause_started_at,
+                "reconnect_reconnected_at": target_run.resumed_at,
             },
             port,
         )
 
-    fault_rows, rows, observations, port = asyncio.run(scenario())
-    assert any(row["parse_errors"] > 0 for row in fault_rows if row["node_id"] == "02:aa:bb:cc:dd:ee")
+    rows, observations, port = asyncio.run(scenario())
+    assert observations["reconnect_reconnected_at"] < observations["server_stopped_at"]
+    assert any(row["parse_errors"] > 0 for row in rows if row["node_id"] == "02:aa:bb:cc:dd:ee")
     result = validate(
         rows, observations, expected_host="127.0.0.1", expected_port=port,
         minimum_duration=0.1, minimum_csi_seconds=0.04,
@@ -295,5 +309,12 @@ def test_accelerated_simulator_fault_matrix_recovers_then_validates_real_timesta
     )
     assert result.passed is True
     target_rows = [row for row in rows if row["node_id"] == "02:11:22:33:44:55"]
+    assert all(row["parse_errors"] == 0 for row in target_rows)
     assert {row["boot_id"] for row in target_rows} == {0x10203040}
+    assert any(
+        row["observed_at"] < observations["server_stopped_at"]
+        and row["sample_started_at"] >= observations["reconnect_reconnected_at"]
+        and row["message_deltas"]["HELLO"] > 0
+        for row in target_rows
+    )
     assert any(row["sample_started_at"] >= observations["reconnect_reconnected_at"] for row in target_rows)

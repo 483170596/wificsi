@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import math
+import socket
+import sys
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -63,6 +67,14 @@ class SimulatorConfig:
                 raise ValueError("pause duration requires a pause start")
         elif not 0 <= self.telemetry_pause_at < self.duration or self.telemetry_pause_duration <= 0:
             raise ValueError("pause must begin during the run and have a positive duration")
+
+
+@dataclass(frozen=True, slots=True)
+class SimulatorRun:
+    started_at: float
+    pause_started_at: float | None
+    resumed_at: float | None
+    finished_at: float
 
 
 class SimulatedNode:
@@ -215,18 +227,36 @@ class _SimulatorProtocol(asyncio.DatagramProtocol):
             self.transport.sendto(ack, addr)
 
 
-async def run_simulator(config: SimulatorConfig) -> None:
+def _simulator_socket() -> socket.socket:
+    transport_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if sys.platform == "win32":
+        enabled = ctypes.c_ulong(0)
+        bytes_returned = ctypes.c_ulong()
+        if ctypes.windll.ws2_32.WSAIoctl(
+            transport_socket.fileno(), 0x9800000C, ctypes.byref(enabled), ctypes.sizeof(enabled),
+            None, 0, ctypes.byref(bytes_returned), None, None,
+        ) != 0:
+            raise OSError(ctypes.get_last_error(), "failed to disable UDP connection reset")
+    transport_socket.bind(("0.0.0.0", 0))
+    transport_socket.setblocking(False)
+    return transport_socket
+
+
+async def run_simulator(config: SimulatorConfig) -> SimulatorRun:
     loop = asyncio.get_running_loop()
     node = SimulatedNode(config)
     transport, _ = await loop.create_datagram_endpoint(
         lambda: _SimulatorProtocol(node),
-        local_addr=("0.0.0.0", 0),
+        sock=_simulator_socket(),
     )
     start = loop.time()
     next_hello = start
     next_state = start
     next_heartbeat = start
     was_paused = False
+    started_at = time.time()
+    pause_started_at: float | None = None
+    resumed_at: float | None = None
     total_frames = math.ceil(config.duration * config.rate)
 
     def elapsed_us() -> int:
@@ -246,8 +276,11 @@ async def run_simulator(config: SimulatorConfig) -> None:
                 and config.telemetry_pause_at <= elapsed < config.telemetry_pause_at + config.telemetry_pause_duration
             ):
                 was_paused = True
+                if pause_started_at is None:
+                    pause_started_at = time.time()
                 continue
             if was_paused:
+                resumed_at = time.time()
                 state = StableState.ACTIVE if elapsed < config.duration / 2 else StableState.INACTIVE
                 send(node.hello(elapsed_us()))
                 send(node.sensing(elapsed_us(), state))
@@ -277,6 +310,7 @@ async def run_simulator(config: SimulatorConfig) -> None:
         await asyncio.sleep(0)
     finally:
         transport.close()
+    return SimulatorRun(started_at, pause_started_at, resumed_at, time.time())
 
 
 def _mac(value: str) -> bytes:

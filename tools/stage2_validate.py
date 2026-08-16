@@ -62,6 +62,15 @@ def _sample_interval(row: dict[str, Any]) -> float | None:
     return interval
 
 
+def _has_target_telemetry(row: dict[str, Any]) -> bool:
+    deltas = row.get("message_deltas")
+    return (
+        row.get("state") != "OFFLINE"
+        and isinstance(deltas, dict)
+        and any((_number(deltas.get(name)) or 0) > 0 for name in REQUIRED_RESUMED_MESSAGES)
+    )
+
+
 def validate(
     rows: list[dict[str, Any]],
     observations: dict[str, Any],
@@ -103,7 +112,8 @@ def validate(
             failures.append("invalid_sample_interval")
         if interval is None:
             continue
-        duration += interval
+        if _has_target_telemetry(row):
+            duration += interval
         if delta is None or delta < 0 or rate is None or abs(rate - delta / interval) > 0.001:
             failures.append("invalid_csi_measurement")
             continue
@@ -176,6 +186,10 @@ def validate(
             failures.append("missing_post_reconnect_telemetry")
         if any(event in {stopped, started, rediscovered} for event in (disconnected, reconnected)):
             failures.append("reconnect_not_distinct_from_server_restart")
+        if stopped is not None and rediscovered is not None and not (
+            reconnected < stopped or disconnected > rediscovered
+        ):
+            failures.append("reconnect_overlaps_server_restart")
 
     events = _command_events(rows)
     command_nodes = {event.get("node_id") for event in events if event.get("opcode") in {"GET_CONFIG", "RESET_BASELINE"}}
