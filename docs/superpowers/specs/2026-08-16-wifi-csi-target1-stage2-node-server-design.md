@@ -245,12 +245,22 @@ append the same 16-byte config body; RESET has no body.
 The server sends a command to the source address and port of the last valid
 node datagram. A COMMAND header contains the target node ID and the target's
 currently observed boot ID; its header sequence equals the correlation ID and
-its device time is zero. Retries resend identical bytes after 500 ms and 1000
-ms, then fail after the third total send. The node rejects a command for a
-different node or boot. A COMMAND_ACK uses the node's normal outgoing sequence
-and device time. The node caches the last 16 `(boot_id, correlation_id)`
-results and returns the cached ACK for duplicates without reapplying the
-operation.
+its device time is zero. Each server process chooses its first correlation ID
+uniformly from the nonzero uint32 range using a cryptographically secure
+source, then increments monotonically with uint32 wrap while skipping zero.
+This avoids deterministic reuse of the node's same-boot command cache after a
+server restart without adding persistence or protocol fields. With `k` cached
+IDs, the residual restart collision probability for the first command is
+`k / (2^32 - 1)`; at the 16-entry cache maximum this is about 3.73e-9 (roughly
+1 in 268 million).
+
+One encoded command is sent at transaction offsets 0, 500 ms, and 1000 ms.
+All retries use identical bytes. The transaction retains its pending ACK
+through 1500 ms, providing a final 500 ms response window after the third send,
+and then returns timeout. The node rejects a command for a different node or
+boot. A COMMAND_ACK uses the node's normal outgoing sequence and device time.
+The node caches the last 16 `(boot_id, correlation_id)` results and returns the
+cached ACK for duplicates without reapplying the operation.
 
 ## 5. Node Runtime Behavior
 

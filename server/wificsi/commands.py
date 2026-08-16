@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import secrets
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -61,12 +62,17 @@ class CommandManager:
         sendto: Callable[[bytes, tuple[str, int]], None],
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        correlation_start: int | None = None,
     ):
         self._registry = registry
         self._sendto = sendto
         self._clock = clock
         self._sleep = sleep
-        self._next_correlation = 1
+        if correlation_start is None:
+            correlation_start = secrets.randbelow(0xFFFFFFFF) + 1
+        if not 1 <= correlation_start <= 0xFFFFFFFF:
+            raise ValueError("correlation start must be a nonzero uint32")
+        self._next_correlation = correlation_start
         self._pending: dict[tuple[bytes, int], _Pending] = {}
 
     def _allocate_correlation(self) -> int:
@@ -109,24 +115,37 @@ class CommandManager:
         key = (node_id, correlation)
         self._pending[key] = _Pending(snapshot.boot_id, opcode, future)
         attempts = 0
+        started_at = self._clock()
         try:
-            for delay_after_send in (0.5, 1.0, None):
+            for response_deadline_offset in (0.5, 1.0, 1.5):
                 attempts += 1
                 self._sendto(encoded, snapshot.endpoint)
                 if future.done():
                     ack = future.result()
                     return CommandResult(ack.status.value == 0, correlation, attempts, ack=ack)
-                if delay_after_send is None:
-                    break
-                sleeper = asyncio.create_task(self._sleep(delay_after_send))
-                done, _ = await asyncio.wait(
-                    {future, sleeper},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if future in done:
-                    sleeper.cancel()
-                    ack = future.result()
-                    return CommandResult(ack.status.value == 0, correlation, attempts, ack=ack)
+                delay = max(0.0, started_at + response_deadline_offset - self._clock())
+                sleeper = asyncio.create_task(self._sleep(delay))
+                try:
+                    done, _ = await asyncio.wait(
+                        {future, sleeper},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if future in done:
+                        ack = future.result()
+                        return CommandResult(
+                            ack.status.value == 0,
+                            correlation,
+                            attempts,
+                            ack=ack,
+                        )
+                    await sleeper
+                finally:
+                    if not sleeper.done():
+                        sleeper.cancel()
+                    try:
+                        await sleeper
+                    except asyncio.CancelledError:
+                        pass
             return CommandResult(False, correlation, attempts, error="timeout")
         finally:
             self._pending.pop(key, None)
