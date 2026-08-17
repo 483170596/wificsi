@@ -11,3 +11,8 @@ sdkconfig.old
 build/
 managed_components/
 dependencies.lock
+
+# Frontend
+web/node_modules/
+web/dist/
+
