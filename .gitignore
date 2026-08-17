@@ -1,1 +1,18 @@
 .worktrees/
+.artifacts/
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# ESP-IDF generated files and local overrides
+sdkconfig
+sdkconfig.old
+build/
+managed_components/
+dependencies.lock
+
+# Frontend
+web/node_modules/
+web/dist/
+
